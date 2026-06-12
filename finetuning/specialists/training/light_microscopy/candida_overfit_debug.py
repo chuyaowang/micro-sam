@@ -7,13 +7,20 @@ data / model / loss wiring rather than in generalization, and there is no point 
 full training run until this passes.
 
 It deliberately reuses ``torch_em.trainer.DefaultTrainer`` -- the exact trainer the real
-multi-GPU run uses (via ``train_multi_gpu``) -- on a single GPU with no DDP. So this probe
-exercises the real per-rank training step (same forward, loss application and logging) and the
-TensorBoard output has the identical schema to the cross-validation runs
+multi-GPU run uses (via ``train_multi_gpu``). By default it runs on a single GPU with no DDP, so
+this probe exercises the real per-rank training step (same forward, loss application and logging)
+and the TensorBoard output has the identical schema to the cross-validation runs
 (``train/loss``, ``validation/loss``, ``validation/metric`` plus raw/target/prediction image
-grids). The only layer it isolates out is DDP gradient synchronisation, which is intentional.
+grids).
 
-Runs on a single GPU, so it can be called directly from a notebook cell::
+Pass ``--multi-gpu`` to instead distribute the probe across all local GPUs (e.g. Kaggle's
+2x T4) via the same ``train_multi_gpu`` path the cross-validation uses. This reuses
+``build_unetr_model`` from ``candida_multigpu_ais``, so no model code is duplicated. Both ranks
+overfit the *same* single image (validation == train); ``DistributedSampler`` just splits the
+``n_samples`` indices across them, giving an effective batch of one-per-GPU. This roughly halves
+the wall-clock to memorization when a single T4 is already VRAM-bound at batch size 1.
+
+The single-GPU default can be called directly from a notebook cell::
 
     from candida_overfit_debug import overfit_single_image
     result = overfit_single_image(
@@ -38,9 +45,10 @@ import torch
 
 import torch_em
 from torch_em.data.sampler import MinInstanceSampler
+from torch_em.multi_gpu_training import train_multi_gpu
 
 from micro_sam.util import get_device
-from micro_sam.training import default_sam_loader
+from micro_sam.training import default_sam_loader, default_sam_dataset
 from micro_sam.training.util import get_trainable_sam_model, require_8bit
 from micro_sam.instance_segmentation import get_unetr
 
@@ -64,9 +72,13 @@ def _build_model(model_type, encoder, decoder, device, strict_decoder_loading=Tr
     return model
 
 
-def _single_image_loader(raw_path, label_path, patch_shape, n_samples, is_train):
-    """Single-image AIS loader with augmentation disabled."""
-    return default_sam_loader(
+def _dataset_kwargs(raw_path, label_path, patch_shape, n_samples, is_train):
+    """Shared default_sam_dataset kwargs for the single training image (no augmentation).
+
+    Used both to build the single-GPU loader and as the train/val dataset kwargs for the
+    multi-GPU (DDP) path, so the two paths see an identical dataset definition.
+    """
+    return dict(
         raw_paths=[str(raw_path)],
         label_paths=[str(label_path)],
         raw_key=None,
@@ -75,14 +87,21 @@ def _single_image_loader(raw_path, label_path, patch_shape, n_samples, is_train)
         with_segmentation_decoder=True,
         train_instance_segmentation_only=True,
         with_channels=True,
-        batch_size=1,
-        num_workers=0,
-        shuffle=False,
         is_train=is_train,
         raw_transform=require_8bit,
         transform=None,  # no augmentation: we want to memorize this exact image
         sampler=MinInstanceSampler(2, min_size=25),
         n_samples=n_samples,
+    )
+
+
+def _single_image_loader(raw_path, label_path, patch_shape, n_samples, is_train, num_workers=0):
+    """Single-image AIS loader with augmentation disabled (single-GPU path)."""
+    return default_sam_loader(
+        **_dataset_kwargs(raw_path, label_path, patch_shape, n_samples, is_train),
+        batch_size=1,
+        num_workers=num_workers,
+        shuffle=False,
     )
 
 
@@ -101,6 +120,9 @@ def overfit_single_image(
     name: Optional[str] = None,
     pass_threshold: float = 0.1,
     device: Optional[Union[str, torch.device]] = None,
+    multi_gpu: bool = False,
+    mixed_precision: bool = True,
+    num_workers: int = 0,
 ) -> Dict:
     """Train on one image (no augmentation, validation == train) via DefaultTrainer.
 
@@ -120,45 +142,87 @@ def overfit_single_image(
         name: Run name. Defaults to ``overfit_<raw-stem>``.
         pass_threshold: ``validation/metric`` below this is reported as PASS. Heuristic only --
             the TensorBoard curve is the real evidence.
-        device: Torch device. Defaults to the best available.
+        device: Torch device (single-GPU path only). Defaults to the best available.
+        multi_gpu: If True, distribute across all local GPUs via ``train_multi_gpu`` (DDP).
+            Must be launched as a script (``mp.spawn`` re-imports the module), not called inline.
+        mixed_precision: Use fp16 autocast. Safe on T4 (Tensor Cores) and lowers VRAM; set False
+            for an fp32-pure probe.
+        num_workers: DataLoader workers per process.
 
     Returns:
         Dict with best_metric, latest_metric, passed, name and log_dir.
     """
-    device = get_device(device)
-
     if name is None:
         stem = os.path.splitext(os.path.basename(str(raw_path)))[0]
         name = f"overfit_{stem}"
     log_dir = os.path.join(save_root or ".", "logs", name)
 
-    print(f"Overfit sanity check on:\n  raw:   {raw_path}\n  label: {label_path}\n"
-          f"  device: {device}\n  tensorboard log_dir: {log_dir}")
-
-    # Train and validation both point at the single image (validation == train).
-    train_loader = _single_image_loader(raw_path, label_path, patch_shape, n_samples=iters_per_epoch, is_train=True)
-    val_loader = _single_image_loader(raw_path, label_path, patch_shape, n_samples=max(1, iters_per_epoch // 5), is_train=False)
-
-    model = _build_model(model_type, encoder, decoder, device)
     loss = torch_em.loss.DiceBasedDistanceLoss(mask_distances_in_bg=True)
+    n_val = max(1, iters_per_epoch // 5)
 
-    trainer = torch_em.trainer.DefaultTrainer(
-        name=name,
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        loss=loss,
-        metric=loss,
-        optimizer=torch.optim.AdamW(model.parameters(), lr=lr),
-        device=device,
-        # fp32 so mixed precision is ruled out as a confound for this correctness probe.
-        mixed_precision=False,
-        log_image_interval=log_image_interval,
-        early_stopping=None,  # we want to watch it overfit, not stop early
-        save_root=save_root,
-        compile_model=False,
-    )
-    trainer.fit(iterations=n_iterations)
+    mode = (f"multi-GPU DDP ({torch.cuda.device_count()} GPUs)" if multi_gpu else "single process")
+    print(f"Overfit sanity check on:\n  raw:   {raw_path}\n  label: {label_path}\n"
+          f"  mode: {mode}\n  mixed_precision: {mixed_precision}\n  tensorboard log_dir: {log_dir}")
+
+    if multi_gpu:
+        # Reuse the exact model factory and DDP wiring the cross-validation script uses. Lazy
+        # import so the single-GPU function-call path does not require candida_multigpu_ais.
+        from candida_multigpu_ais import build_unetr_model
+
+        # Both train and val datasets point at the same single image (validation == train);
+        # DistributedSampler splits the n_samples indices across ranks -> effective batch = 1/GPU.
+        train_multi_gpu(
+            model_callable=build_unetr_model,
+            model_kwargs=dict(
+                model_type=model_type, checkpoint_path=encoder, decoder_path=decoder,
+                freeze=None, strict_decoder_loading=True,
+            ),
+            train_dataset_callable=default_sam_dataset,
+            train_dataset_kwargs=_dataset_kwargs(raw_path, label_path, patch_shape, iters_per_epoch, True),
+            val_dataset_callable=default_sam_dataset,
+            val_dataset_kwargs=_dataset_kwargs(raw_path, label_path, patch_shape, n_val, False),
+            loader_kwargs=dict(batch_size=1, shuffle=True, num_workers=num_workers, pin_memory=True),
+            iterations=n_iterations,
+            find_unused_parameters=True,
+            optimizer_callable=torch.optim.AdamW,
+            optimizer_kwargs=dict(lr=lr),
+            # trainer params (forwarded to DefaultTrainer via **kwargs)
+            trainer_callable=torch_em.trainer.DefaultTrainer,
+            name=name,
+            save_root=save_root,
+            loss=loss,
+            metric=loss,
+            early_stopping=None,  # we want to watch it overfit, not stop early
+            mixed_precision=mixed_precision,
+            log_image_interval=log_image_interval,
+            compile_model=False,
+        )
+    else:
+        device = get_device(device)
+        print(f"  device: {device}")
+
+        # Train and validation both point at the single image (validation == train).
+        train_loader = _single_image_loader(raw_path, label_path, patch_shape, iters_per_epoch, True, num_workers)
+        val_loader = _single_image_loader(raw_path, label_path, patch_shape, n_val, False, num_workers)
+
+        model = _build_model(model_type, encoder, decoder, device)
+
+        trainer = torch_em.trainer.DefaultTrainer(
+            name=name,
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            loss=loss,
+            metric=loss,
+            optimizer=torch.optim.AdamW(model.parameters(), lr=lr),
+            device=device,
+            mixed_precision=mixed_precision,
+            log_image_interval=log_image_interval,
+            early_stopping=None,  # we want to watch it overfit, not stop early
+            save_root=save_root,
+            compile_model=False,
+        )
+        trainer.fit(iterations=n_iterations)
 
     # Read the best / latest validation metric back from the saved checkpoints.
     ckpt_dir = os.path.join(save_root or ".", "checkpoints", name)
@@ -213,6 +277,12 @@ def main():
     parser.add_argument("--save-root", default=None,
                         help="Root for logs/<name> and checkpoints/<name>. Default: cwd.")
     parser.add_argument("--name", default=None, help="Run name. Default: overfit_<raw-stem>.")
+    parser.add_argument("--multi-gpu", action="store_true",
+                        help="Distribute across all local GPUs via DDP (train_multi_gpu). "
+                             "Default: single GPU. Effective batch = 1 per GPU.")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers per process.")
+    parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use fp16 autocast (safe on T4, lowers VRAM). Use --no-mixed-precision for fp32.")
     args = parser.parse_args()
 
     overfit_single_image(
@@ -222,6 +292,7 @@ def main():
         n_iterations=args.iterations, lr=args.lr, pass_threshold=args.pass_threshold,
         iters_per_epoch=args.iters_per_epoch, log_image_interval=args.log_image_interval,
         save_root=args.save_root, name=args.name,
+        multi_gpu=args.multi_gpu, mixed_precision=args.mixed_precision, num_workers=args.num_workers,
     )
 
 
