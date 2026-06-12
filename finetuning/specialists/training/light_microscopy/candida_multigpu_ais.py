@@ -207,6 +207,9 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        # Under DDP (mp.spawn) workers re-import the whole stack (torch_em -> tensorflow/jax/wandb)
+        # on creation. Keep them alive across epochs so that import cost is paid once, not per epoch.
+        persistent_workers=args.num_workers > 0,
     )
 
     loss = torch_em.loss.DiceBasedDistanceLoss(mask_distances_in_bg=True)

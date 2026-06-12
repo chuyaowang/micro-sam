@@ -181,7 +181,10 @@ def overfit_single_image(
             train_dataset_kwargs=_dataset_kwargs(raw_path, label_path, patch_shape, iters_per_epoch, True),
             val_dataset_callable=default_sam_dataset,
             val_dataset_kwargs=_dataset_kwargs(raw_path, label_path, patch_shape, n_val, False),
-            loader_kwargs=dict(batch_size=1, shuffle=True, num_workers=num_workers, pin_memory=True),
+            # persistent_workers: under DDP (mp.spawn) workers re-import the whole stack on creation,
+            # so keep them alive across epochs instead of respawning each epoch (num_workers>0 only).
+            loader_kwargs=dict(batch_size=1, shuffle=True, num_workers=num_workers, pin_memory=True,
+                               persistent_workers=num_workers > 0),
             iterations=n_iterations,
             find_unused_parameters=True,
             optimizer_callable=torch.optim.AdamW,
