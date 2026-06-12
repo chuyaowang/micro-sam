@@ -99,7 +99,7 @@ def overfit_single_image(
     log_image_interval: int = 10,
     save_root: Optional[str] = None,
     name: Optional[str] = None,
-    pass_threshold: float = 0.2,
+    pass_threshold: float = 0.1,
     device: Optional[Union[str, torch.device]] = None,
 ) -> Dict:
     """Train on one image (no augmentation, validation == train) via DefaultTrainer.
@@ -203,7 +203,9 @@ def main():
     parser.add_argument("--model-type", default="vit_b_lm")
     parser.add_argument("--patch-shape", type=int, nargs=2, default=[512, 512])
     parser.add_argument("--iterations", type=int, default=300)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--pass-threshold", type=float, default=0.1,
+                        help="Report PASS when best validation/metric drops below this. Heuristic.")
     parser.add_argument("--iters-per-epoch", type=int, default=25,
                         help="Iterations between validation passes.")
     parser.add_argument("--log-image-interval", type=int, default=10,
@@ -217,7 +219,7 @@ def main():
         raw_path=args.raw, label_path=args.label,
         encoder=args.encoder, decoder=args.decoder,
         model_type=args.model_type, patch_shape=tuple(args.patch_shape),
-        n_iterations=args.iterations, lr=args.lr,
+        n_iterations=args.iterations, lr=args.lr, pass_threshold=args.pass_threshold,
         iters_per_epoch=args.iters_per_epoch, log_image_interval=args.log_image_interval,
         save_root=args.save_root, name=args.name,
     )
