@@ -73,6 +73,16 @@ def _build_model(model_type, encoder, decoder, device, strict_decoder_loading=Tr
     return model
 
 
+def _no_augmentation(raw, labels):
+    """Identity transform: disable all geometric/photometric augmentation.
+
+    ``default_sam_dataset`` substitutes the default (flip + 90-degree rotation) pipeline when
+    ``transform is None``, so an explicit no-op is required to truly disable augmentation. Kept
+    at module level (not a lambda) so it survives the ``mp.spawn`` pickle on the DDP/worker paths.
+    """
+    return raw, labels
+
+
 def _dataset_kwargs(raw_path, label_path, patch_shape, n_samples, is_train):
     """Shared default_sam_dataset kwargs for the single training image (no augmentation).
 
@@ -90,7 +100,10 @@ def _dataset_kwargs(raw_path, label_path, patch_shape, n_samples, is_train):
         with_channels=True,
         is_train=is_train,
         raw_transform=require_8bit,
-        transform=None,  # no augmentation: we want to memorize this exact image
+        # Validation must see the exact fixed crop (no flips/rotations) so its loss reflects model
+        # state. transform=None would make default_sam_dataset substitute the default augmentation
+        # pipeline, so the val path uses an explicit no-op; train keeps the default augmentations.
+        transform=None if is_train else _no_augmentation,
         sampler=MinInstanceSampler(2, min_size=25),
         n_samples=n_samples,
     )
