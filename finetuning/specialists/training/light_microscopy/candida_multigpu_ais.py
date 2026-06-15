@@ -100,12 +100,14 @@ class RankTensorboardLogger(TensorboardLogger):
 
     def log_train(self, step, loss, lr, x, y, prediction, log_gradients=False):
         super().log_train(step, loss, lr, x, y, prediction, log_gradients)
-        if self.spike_image_threshold is not None and float(loss) > self.spike_image_threshold:
+        loss_value = loss.item() if hasattr(loss, "item") else float(loss)
+        if self.spike_image_threshold is not None and loss_value > self.spike_image_threshold:
             self.log_images(step, x, y, prediction, "train_spike")
 
     def log_validation(self, step, metric, loss, x, y, prediction):
         super().log_validation(step, metric, loss, x, y, prediction)
-        if self.spike_image_threshold is not None and float(loss) > self.spike_image_threshold:
+        loss_value = loss.item() if hasattr(loss, "item") else float(loss)
+        if self.spike_image_threshold is not None and loss_value > self.spike_image_threshold:
             self.log_images(step, x, y, prediction, "validation_spike")
 
 
@@ -361,9 +363,10 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         val_dataset_kwargs=val_dataset_kwargs,
         loader_kwargs=loader_kwargs,
         iterations=int(args.iterations),
-        # With the encoder unfrozen every parameter receives a gradient, but keep this True so
-        # the script also works when --freeze image_encoder is passed (DDP needs it then).
-        find_unused_parameters=True,
+        # Every trainable parameter receives a gradient each step, so the per-iteration autograd
+        # graph traversal that find_unused_parameters=True performs is pure overhead (and warns).
+        # Only enable it when freezing, as a conservative guard for partially-used subgraphs.
+        find_unused_parameters=args.freeze is not None,
         optimizer_callable=torch.optim.AdamW,
         optimizer_kwargs=dict(lr=args.lr),
         lr_scheduler_callable=torch.optim.lr_scheduler.ReduceLROnPlateau,

@@ -102,6 +102,9 @@ def _single_image_loader(raw_path, label_path, patch_shape, n_samples, is_train,
         **_dataset_kwargs(raw_path, label_path, patch_shape, n_samples, is_train),
         batch_size=1,
         num_workers=num_workers,
+        # Keep workers alive across epochs; otherwise short (single-image) epochs respawn them
+        # every epoch and each spawn re-imports the whole stack (num_workers>0 only).
+        persistent_workers=num_workers > 0,
         shuffle=False,
     )
 
@@ -195,7 +198,9 @@ def overfit_single_image(
             loader_kwargs=dict(batch_size=1, shuffle=True, num_workers=num_workers, pin_memory=True,
                                persistent_workers=num_workers > 0),
             iterations=n_iterations,
-            find_unused_parameters=True,
+            # The full model is trained (freeze=None), so every parameter gets a gradient each
+            # step; find_unused_parameters=True would only add per-iteration graph-traversal overhead.
+            find_unused_parameters=False,
             optimizer_callable=torch.optim.AdamW,
             optimizer_kwargs=dict(lr=lr),
             # trainer params (forwarded to DefaultTrainer via **kwargs)
@@ -222,7 +227,8 @@ def overfit_single_image(
             **_dataset_kwargs(raw_path, label_path, patch_shape, n_val, False)
         )
         val_loader = torch.utils.data.DataLoader(
-            val_dataset, batch_size=1, shuffle=False, num_workers=num_workers
+            val_dataset, batch_size=1, shuffle=False, num_workers=num_workers,
+            persistent_workers=num_workers > 0,  # avoid per-epoch worker respawn + re-import
         )
 
         model = _build_model(model_type, encoder, decoder, device)
