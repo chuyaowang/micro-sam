@@ -52,10 +52,38 @@ import torch_em
 from torch_em.data.sampler import MinInstanceSampler
 from torch_em.transform.augmentation import KorniaAugmentationPipeline
 from torch_em.multi_gpu_training import train_multi_gpu
+from torch_em.trainer.tensorboard_logger import TensorboardLogger
 
 from micro_sam.training import default_sam_dataset
 from micro_sam.training.util import get_trainable_sam_model, require_8bit
 from micro_sam.instance_segmentation import get_unetr
+
+
+# ---------------------------------------------------------------------------
+# Per-rank TensorBoard logging (module-level so it survives the mp.spawn re-import).
+# ---------------------------------------------------------------------------
+class RankTensorboardLogger(TensorboardLogger):
+    """Write each DDP rank's TensorBoard logs to a ``logs/<name>/rank<K>/`` subfolder.
+
+    torch_em's default logger derives its log dir from ``trainer.name`` only (no rank
+    component), so every rank's SummaryWriter targets the same directory and TensorBoard
+    merges their event files into one noisy run. Since each rank validates/trains on its
+    own random crops, the per-rank loss/metric series differ and should be shown
+    separately. We temporarily suffix ``trainer.name`` while the parent derives ``log_dir``,
+    then restore it so checkpoint paths (which also use ``name``) are unaffected.
+    """
+
+    def __init__(self, trainer, save_root, **kwargs):
+        rank = getattr(trainer, "rank", None)
+        if rank is None:  # single-GPU path: behave exactly like the base logger
+            super().__init__(trainer, save_root, **kwargs)
+            return
+        original_name = trainer.name
+        trainer.name = os.path.join(original_name, f"rank{rank}")
+        try:
+            super().__init__(trainer, save_root, **kwargs)
+        finally:
+            trainer.name = original_name
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +266,7 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         lr_scheduler_kwargs=dict(mode="min", factor=0.9, patience=3),
         # trainer params (forwarded to DefaultTrainer via **kwargs)
         trainer_callable=torch_em.trainer.DefaultTrainer,
+        logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
         name=name,
         save_root=args.save_root,
         loss=loss,

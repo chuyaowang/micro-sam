@@ -167,7 +167,7 @@ def overfit_single_image(
     if multi_gpu:
         # Reuse the exact model factory and DDP wiring the cross-validation script uses. Lazy
         # import so the single-GPU function-call path does not require candida_multigpu_ais.
-        from candida_multigpu_ais import build_unetr_model
+        from candida_multigpu_ais import build_unetr_model, RankTensorboardLogger
 
         # Both train and val datasets point at the same single image (validation == train);
         # DistributedSampler splits the n_samples indices across ranks -> effective batch = 1/GPU.
@@ -191,6 +191,7 @@ def overfit_single_image(
             optimizer_kwargs=dict(lr=lr),
             # trainer params (forwarded to DefaultTrainer via **kwargs)
             trainer_callable=torch_em.trainer.DefaultTrainer,
+            logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
             name=name,
             save_root=save_root,
             loss=loss,
