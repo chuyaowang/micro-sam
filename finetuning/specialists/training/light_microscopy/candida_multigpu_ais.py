@@ -45,6 +45,7 @@ import argparse
 import statistics
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import kornia.augmentation as K
 
@@ -53,6 +54,7 @@ from torch_em.data.sampler import MinInstanceSampler
 from torch_em.transform.augmentation import KorniaAugmentationPipeline
 from torch_em.multi_gpu_training import train_multi_gpu
 from torch_em.trainer.tensorboard_logger import TensorboardLogger
+from torch_em.util import load_image
 
 from micro_sam.training import default_sam_dataset
 from micro_sam.training.util import get_trainable_sam_model, require_8bit
@@ -60,20 +62,31 @@ from micro_sam.instance_segmentation import get_unetr
 
 
 # ---------------------------------------------------------------------------
-# Per-rank TensorBoard logging (module-level so it survives the mp.spawn re-import).
+# Per-rank TensorBoard logging + loss-spike image capture (module-level so it
+# survives the mp.spawn re-import).
 # ---------------------------------------------------------------------------
 class RankTensorboardLogger(TensorboardLogger):
-    """Write each DDP rank's TensorBoard logs to a ``logs/<name>/rank<K>/`` subfolder.
+    """Per-rank TensorBoard logging plus on-demand image capture when the loss spikes.
 
-    torch_em's default logger derives its log dir from ``trainer.name`` only (no rank
-    component), so every rank's SummaryWriter targets the same directory and TensorBoard
-    merges their event files into one noisy run. Since each rank validates/trains on its
-    own random crops, the per-rank loss/metric series differ and should be shown
-    separately. We temporarily suffix ``trainer.name`` while the parent derives ``log_dir``,
-    then restore it so checkpoint paths (which also use ``name``) are unaffected.
+    Two behaviors on top of torch_em's ``TensorboardLogger``:
+
+    1. **Per-rank subfolders.** The base logger derives its log dir from ``trainer.name``
+       only (no rank component), so every DDP rank's SummaryWriter targets the same
+       directory and TensorBoard merges their event files into one noisy run. We
+       temporarily suffix ``trainer.name`` while the parent derives ``log_dir``, then
+       restore it so checkpoint paths (which also use ``name``) are unaffected. Single-GPU
+       runs (``rank is None``) keep the base directory.
+
+    2. **Loss-spike images.** The base logger only writes prediction images on the periodic
+       ``log_image_interval``, so a loss spike *between* intervals is never imaged. When the
+       train/val loss exceeds ``spike_image_threshold`` we additionally log input/target/
+       prediction under a dedicated ``train_spike/`` or ``validation_spike/`` tag, so spikes
+       are easy to find and inspect. (Off-interval frames carry no gradient overlay, since
+       the trainer only ``retain_grad()``s the prediction at the periodic interval.)
     """
 
-    def __init__(self, trainer, save_root, **kwargs):
+    def __init__(self, trainer, save_root, spike_image_threshold=None, **kwargs):
+        self.spike_image_threshold = spike_image_threshold
         rank = getattr(trainer, "rank", None)
         if rank is None:  # single-GPU path: behave exactly like the base logger
             super().__init__(trainer, save_root, **kwargs)
@@ -84,6 +97,97 @@ class RankTensorboardLogger(TensorboardLogger):
             super().__init__(trainer, save_root, **kwargs)
         finally:
             trainer.name = original_name
+
+    def log_train(self, step, loss, lr, x, y, prediction, log_gradients=False):
+        super().log_train(step, loss, lr, x, y, prediction, log_gradients)
+        if self.spike_image_threshold is not None and float(loss) > self.spike_image_threshold:
+            self.log_images(step, x, y, prediction, "train_spike")
+
+    def log_validation(self, step, metric, loss, x, y, prediction):
+        super().log_validation(step, metric, loss, x, y, prediction)
+        if self.spike_image_threshold is not None and float(loss) > self.spike_image_threshold:
+            self.log_images(step, x, y, prediction, "validation_spike")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic, cell-rich validation patch (module-level for mp.spawn).
+# ---------------------------------------------------------------------------
+def _best_variance_patch(raw: np.ndarray, patch_shape) -> Tuple[slice, slice]:
+    """Return the spatial bounding box of the highest-variance non-overlapping tile.
+
+    The image is divided into a grid of non-overlapping ``patch_shape`` windows and each
+    tile is scored by its intensity variance. Bright cells over dark background produce a
+    large spread (high-intensity cell pixels + low-intensity background pixels), so the
+    max-variance tile is likely to contain cells -- unlike a blind center crop, which can
+    land on empty background. Returns ``(slice_y, slice_x)`` over the spatial axes only.
+    """
+    pH, pW = int(patch_shape[-2]), int(patch_shape[-1])
+    channel_first = raw.ndim == 3 and raw.shape[-1] > 16
+    if raw.ndim == 3 and not channel_first:      # channel-last (H, W, C)
+        H, W = raw.shape[0], raw.shape[1]
+    elif raw.ndim == 3:                          # channel-first (C, H, W)
+        H, W = raw.shape[1], raw.shape[2]
+    else:                                        # (H, W)
+        H, W = raw.shape
+
+    ny, nx = max(1, H // pH), max(1, W // pW)
+    best, best_score = (0, 0), -np.inf
+    for iy in range(ny):
+        for ix in range(nx):
+            y0, x0 = iy * pH, ix * pW
+            if channel_first:
+                tile = raw[:, y0:y0 + pH, x0:x0 + pW]
+            elif raw.ndim == 3:
+                tile = raw[y0:y0 + pH, x0:x0 + pW, :]
+            else:
+                tile = raw[y0:y0 + pH, x0:x0 + pW]
+            score = float(np.var(tile))
+            if score > best_score:
+                best_score, best = score, (y0, x0)
+
+    y0, x0 = best
+    return slice(y0, y0 + pH), slice(x0, x0 + pW)
+
+
+def fixed_crop_val_dataset(**kwargs):
+    """Build a validation dataset that always uses ONE fixed, cell-rich patch per image.
+
+    Drop-in replacement for ``default_sam_dataset`` as the validation dataset callable. For
+    each image it loads the array, picks the highest-variance ``patch_shape`` tile
+    (`_best_variance_patch`), and crops both raw and label to that window. Because the
+    cropped array equals ``patch_shape``, the dataset's own random crop becomes a no-op
+    (``shape - patch_shape == 0``), so validation sees the **same patch every time**. A
+    val-loss spike then reflects model state, not which crop got drawn. The instance
+    ``sampler`` is dropped (a fixed patch would loop forever against the rejection sampler).
+    """
+    raw_paths = kwargs.pop("raw_paths")
+    label_paths = kwargs.pop("label_paths")
+    kwargs.pop("raw_key", None)
+    kwargs.pop("label_key", None)
+    kwargs.pop("sampler", None)
+    patch_shape = kwargs["patch_shape"]
+
+    if not isinstance(raw_paths, (list, tuple)):
+        raw_paths, label_paths = [raw_paths], [label_paths]
+
+    cropped_raw, cropped_label = [], []
+    for rp, lp in zip(raw_paths, label_paths):
+        raw = np.asarray(load_image(rp))
+        label = np.asarray(load_image(lp))
+        sy, sx = _best_variance_patch(raw, patch_shape)
+        if raw.ndim == 3 and raw.shape[-1] > 16:      # channel-first (C, H, W)
+            cropped_raw.append(raw[:, sy, sx])
+        elif raw.ndim == 3:                           # channel-last (H, W, C)
+            cropped_raw.append(raw[sy, sx, :])
+        else:
+            cropped_raw.append(raw[sy, sx])
+        cropped_label.append(label[sy, sx])
+
+    return default_sam_dataset(
+        raw_paths=cropped_raw, raw_key=None,
+        label_paths=cropped_label, label_key=None,
+        sampler=None, **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +357,7 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         ),
         train_dataset_callable=default_sam_dataset,
         train_dataset_kwargs=train_dataset_kwargs,
-        val_dataset_callable=default_sam_dataset,
+        val_dataset_callable=fixed_crop_val_dataset,  # fixed cell-rich patch (see fixed_crop_val_dataset)
         val_dataset_kwargs=val_dataset_kwargs,
         loader_kwargs=loader_kwargs,
         iterations=int(args.iterations),
@@ -267,6 +371,7 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         # trainer params (forwarded to DefaultTrainer via **kwargs)
         trainer_callable=torch_em.trainer.DefaultTrainer,
         logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
+        logger_kwargs=dict(spike_image_threshold=args.spike_image_threshold),
         name=name,
         save_root=args.save_root,
         loss=loss,
@@ -306,6 +411,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
     parser.add_argument("--batch-size", type=int, default=1, help="Per-GPU batch size.")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers per process.")
+    parser.add_argument("--spike-image-threshold", type=float, default=1.0,
+                        help="Also log input/target/prediction images to a *_spike/ tag whenever the "
+                             "train/val loss exceeds this value (DiceBasedDistanceLoss ranges ~0-3).")
     parser.add_argument("--n-folds", type=int, default=None,
                         help="Number of CV folds. Default = number of images (leave-one-out).")
     parser.add_argument("--fold", type=int, default=None,

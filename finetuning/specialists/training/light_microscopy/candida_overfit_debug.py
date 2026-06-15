@@ -42,6 +42,7 @@ import os
 from typing import Optional, Union, Dict
 
 import torch
+import torch.utils.data
 
 import torch_em
 from torch_em.data.sampler import MinInstanceSampler
@@ -123,6 +124,7 @@ def overfit_single_image(
     multi_gpu: bool = False,
     mixed_precision: bool = True,
     num_workers: int = 0,
+    spike_image_threshold: float = 1.0,
 ) -> Dict:
     """Train on one image (no augmentation, validation == train) via DefaultTrainer.
 
@@ -148,10 +150,16 @@ def overfit_single_image(
         mixed_precision: Use fp16 autocast. Safe on T4 (Tensor Cores) and lowers VRAM; set False
             for an fp32-pure probe.
         num_workers: DataLoader workers per process.
+        spike_image_threshold: Also log input/target/prediction to a ``*_spike/`` tag whenever the
+            train/val loss exceeds this value (helps diagnose loss spikes off the periodic interval).
 
     Returns:
         Dict with best_metric, latest_metric, passed, name and log_dir.
     """
+    # Reuse the CV script's logger (per-rank subfolders + loss-spike image capture) and the
+    # fixed cell-rich validation patch, so the single-GPU and multi-GPU paths stay consistent.
+    from candida_multigpu_ais import RankTensorboardLogger, fixed_crop_val_dataset
+
     if name is None:
         stem = os.path.splitext(os.path.basename(str(raw_path)))[0]
         name = f"overfit_{stem}"
@@ -165,12 +173,13 @@ def overfit_single_image(
           f"  mode: {mode}\n  mixed_precision: {mixed_precision}\n  tensorboard log_dir: {log_dir}")
 
     if multi_gpu:
-        # Reuse the exact model factory and DDP wiring the cross-validation script uses. Lazy
-        # import so the single-GPU function-call path does not require candida_multigpu_ais.
-        from candida_multigpu_ais import build_unetr_model, RankTensorboardLogger
+        # Reuse the exact model factory and DDP wiring the cross-validation script uses.
+        from candida_multigpu_ais import build_unetr_model
 
         # Both train and val datasets point at the same single image (validation == train);
         # DistributedSampler splits the n_samples indices across ranks -> effective batch = 1/GPU.
+        # Validation uses a fixed cell-rich patch (fixed_crop_val_dataset) so its loss reflects
+        # model state, not random crop selection.
         train_multi_gpu(
             model_callable=build_unetr_model,
             model_kwargs=dict(
@@ -179,7 +188,7 @@ def overfit_single_image(
             ),
             train_dataset_callable=default_sam_dataset,
             train_dataset_kwargs=_dataset_kwargs(raw_path, label_path, patch_shape, iters_per_epoch, True),
-            val_dataset_callable=default_sam_dataset,
+            val_dataset_callable=fixed_crop_val_dataset,
             val_dataset_kwargs=_dataset_kwargs(raw_path, label_path, patch_shape, n_val, False),
             # persistent_workers: under DDP (mp.spawn) workers re-import the whole stack on creation,
             # so keep them alive across epochs instead of respawning each epoch (num_workers>0 only).
@@ -192,6 +201,7 @@ def overfit_single_image(
             # trainer params (forwarded to DefaultTrainer via **kwargs)
             trainer_callable=torch_em.trainer.DefaultTrainer,
             logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
+            logger_kwargs=dict(spike_image_threshold=spike_image_threshold),
             name=name,
             save_root=save_root,
             loss=loss,
@@ -205,9 +215,15 @@ def overfit_single_image(
         device = get_device(device)
         print(f"  device: {device}")
 
-        # Train and validation both point at the single image (validation == train).
+        # Training draws random crops of the single image; validation uses a fixed cell-rich
+        # patch (fixed_crop_val_dataset) so its loss reflects model state, not crop selection.
         train_loader = _single_image_loader(raw_path, label_path, patch_shape, iters_per_epoch, True, num_workers)
-        val_loader = _single_image_loader(raw_path, label_path, patch_shape, n_val, False, num_workers)
+        val_dataset = fixed_crop_val_dataset(
+            **_dataset_kwargs(raw_path, label_path, patch_shape, n_val, False)
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=1, shuffle=False, num_workers=num_workers
+        )
 
         model = _build_model(model_type, encoder, decoder, device)
 
@@ -222,6 +238,8 @@ def overfit_single_image(
             device=device,
             mixed_precision=mixed_precision,
             log_image_interval=log_image_interval,
+            logger=RankTensorboardLogger,  # spike-image capture (rank is None -> base log dir)
+            logger_kwargs=dict(spike_image_threshold=spike_image_threshold),
             early_stopping=None,  # we want to watch it overfit, not stop early
             save_root=save_root,
             compile_model=False,
@@ -287,6 +305,9 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers per process.")
     parser.add_argument("--mixed-precision", action=argparse.BooleanOptionalAction, default=True,
                         help="Use fp16 autocast (safe on T4, lowers VRAM). Use --no-mixed-precision for fp32.")
+    parser.add_argument("--spike-image-threshold", type=float, default=1.0,
+                        help="Also log input/target/prediction to a *_spike/ tag whenever the train/val "
+                             "loss exceeds this value (DiceBasedDistanceLoss ranges ~0-3).")
     args = parser.parse_args()
 
     overfit_single_image(
@@ -297,6 +318,7 @@ def main():
         iters_per_epoch=args.iters_per_epoch, log_image_interval=args.log_image_interval,
         save_root=args.save_root, name=args.name,
         multi_gpu=args.multi_gpu, mixed_precision=args.mixed_precision, num_workers=args.num_workers,
+        spike_image_threshold=args.spike_image_threshold,
     )
 
 
