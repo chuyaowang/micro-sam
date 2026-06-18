@@ -39,14 +39,17 @@ trends toward 0.
 """
 
 import os
+from collections import OrderedDict
 from typing import Optional, Union, Dict
 
+import numpy as np
 import torch
 import torch.utils.data
 
 import torch_em
 from torch_em.data.sampler import MinInstanceSampler
 from torch_em.multi_gpu_training import train_multi_gpu
+from torch_em.util import load_image
 
 from micro_sam.util import get_device
 from micro_sam.training import default_sam_loader, default_sam_dataset
@@ -122,6 +125,167 @@ def _single_image_loader(raw_path, label_path, patch_shape, n_samples, is_train,
     )
 
 
+# ---------------------------------------------------------------------------
+# Before/after full-image AIS comparison (in-memory, no checkpoint reload).
+# All module-level so the trainer subclass survives the mp.spawn pickle (DDP path).
+# ---------------------------------------------------------------------------
+def _to_channels_last(image: np.ndarray) -> np.ndarray:
+    """Channels-first ``(C, H, W)`` -> ``(H, W, C)``; leave grayscale / channels-last as-is.
+
+    ``micro_sam.util._to_image`` treats the *last* axis as channels, so the pre-processed
+    channels-first raw tiff must be transposed before inference. Reuses the same
+    ``shape[-1] > 16`` channel-first heuristic as ``_best_variance_patch``.
+    """
+    if image.ndim == 3 and image.shape[-1] > 16:  # (C, H, W): last axis is spatial -> channels first
+        return np.ascontiguousarray(np.transpose(image, (1, 2, 0)))
+    return np.ascontiguousarray(image)
+
+
+def _split_unetr_state(model_state):
+    """Split a UNETR state dict into ``(image_encoder_state, decoder_state)``.
+
+    The UNETR stores the SAM image encoder under ``encoder.*`` and the AIS decoder under the
+    remaining keys. ``predictor.model.image_encoder`` wants the encoder keys *without* the
+    ``encoder.`` prefix; ``get_decoder`` / ``get_unetr`` want the decoder keys verbatim.
+    """
+    encoder_state, decoder_state = OrderedDict(), OrderedDict()
+    for k, v in model_state.items():
+        if k.startswith("encoder."):
+            encoder_state[k[len("encoder."):]] = v
+        else:
+            decoder_state[k] = v
+    return encoder_state, decoder_state
+
+
+def _ais_from_state(predictor, model_state, image, device, tile_shape, halo):
+    """Run AIS on the whole image from in-memory UNETR weights (no checkpoint reload).
+
+    The given ``predictor`` (a plain SAM skeleton) is reused across calls: its image encoder is
+    overwritten with the UNETR's encoder weights and a fresh decoder is built around that same
+    encoder -- the in-memory equivalent of ``get_predictor_and_segmenter``. Returns
+    ``(instances, foreground)``.
+    """
+    from micro_sam import util
+    from micro_sam.instance_segmentation import get_decoder, get_instance_segmentation_generator
+
+    encoder_state, decoder_state = _split_unetr_state(model_state)
+    predictor.model.image_encoder.load_state_dict(encoder_state)
+    predictor.model.eval()
+    decoder = get_decoder(predictor.model.image_encoder, decoder_state, device)
+
+    is_tiled = tile_shape is not None
+    segmenter = get_instance_segmentation_generator(predictor=predictor, is_tiled=is_tiled, decoder=decoder)
+
+    image_embeddings = util.precompute_image_embeddings(
+        predictor=predictor, input_=image, ndim=2, tile_shape=tile_shape, halo=halo,
+    )
+    init_kwargs = dict(image=image, image_embeddings=image_embeddings)
+    generate_kwargs = {"output_mode": None}
+    if is_tiled:
+        init_kwargs["batch_size"] = 1
+        generate_kwargs.update(tile_shape=tile_shape, halo=halo)
+    segmenter.initialize(**init_kwargs)
+    instances = segmenter.generate(**generate_kwargs)
+    foreground = segmenter.get_state()["foreground"]
+    return instances, foreground
+
+
+def _save_comparison_figure(raw_image, gt_labels, results, out_path, model_type):
+    """2x4 grid: rows = (Original, Overfitted); cols = Raw, Ground truth, Instances, Foreground."""
+    import matplotlib
+    matplotlib.use("Agg")  # headless: this runs inside the (DDP) training process
+    import matplotlib.pyplot as plt
+    from torch_em.util.util import get_random_colors
+
+    disp_raw = raw_image if raw_image.ndim == 2 else raw_image[..., :3]
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    for r, key in enumerate(("original", "overfitted")):
+        instances, foreground = results[key]
+        axes[r, 0].imshow(disp_raw, cmap="gray" if disp_raw.ndim == 2 else None)
+        axes[r, 0].set_ylabel(key.capitalize(), fontsize=14)
+        axes[r, 0].set_title("Raw" if r == 0 else "")
+        axes[r, 1].imshow(gt_labels, cmap=get_random_colors(gt_labels), interpolation="nearest")
+        axes[r, 1].set_title(f"Ground truth (n={int(gt_labels.max())})" if r == 0 else "")
+        axes[r, 2].imshow(instances, cmap=get_random_colors(instances), interpolation="nearest")
+        axes[r, 2].set_title(f"Instances (n={int(instances.max())})")
+        axes[r, 3].imshow(foreground, cmap="viridis")
+        axes[r, 3].set_title("Foreground prob")
+        for c in range(4):
+            axes[r, c].set_xticks([])
+            axes[r, c].set_yticks([])
+    fig.suptitle(f"Overfit before/after - {model_type}", fontsize=16)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+class OverfitComparisonTrainer(torch_em.trainer.DefaultTrainer):
+    """``DefaultTrainer`` that, after training, segments the whole image with the original and the
+    overfitted model and saves a before/after figure -- entirely from in-memory weights.
+
+    The **original** model is captured as a CPU snapshot of the freshly built (pretrained) weights
+    at construction, before any optimizer step; the **overfitted** model is the live trained model
+    at the end of ``fit``. Only rank 0 / the single-GPU process produces the figure, so this is
+    safe under ``train_multi_gpu`` (``mp.spawn``) and needs no checkpoint reload or model export.
+    """
+
+    def __init__(self, *args, comparison_kwargs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._comparison_kwargs = comparison_kwargs or {}
+        self._original_model_state = None
+        if self._comparison_kwargs.get("run_comparison", True) and getattr(self, "rank", None) in (None, 0):
+            raw_model = getattr(self.model, "module", self.model)  # unwrap DDP
+            # CPU snapshot so the original weights survive training without holding GPU memory.
+            self._original_model_state = OrderedDict(
+                (k, v.detach().cpu().clone()) for k, v in raw_model.state_dict().items()
+            )
+
+    def fit(self, *args, **kwargs):
+        result = super().fit(*args, **kwargs)
+        if self._original_model_state is not None:
+            try:
+                self._run_full_image_comparison()
+            except Exception as e:  # a post-hoc figure must never crash a finished training run
+                import traceback
+                print(f"[overfit-comparison] skipped: {e}")
+                traceback.print_exc()
+        return result
+
+    def _run_full_image_comparison(self):
+        from micro_sam import util
+
+        ck = self._comparison_kwargs
+        tile_shape = ck.get("tile_shape", (512, 512))
+        halo = ck.get("halo", (64, 64))
+        out_dir = ck.get("figure_dir") or "."
+
+        device = self.device
+        if isinstance(device, int):  # multi-GPU path passes the rank as an int
+            device = torch.device(f"cuda:{device}")
+
+        raw_model = getattr(self.model, "module", self.model)
+        finetuned_state = OrderedDict(
+            (k, v.detach().cpu().clone()) for k, v in raw_model.state_dict().items()
+        )
+
+        raw_image = _to_channels_last(np.asarray(load_image(ck["raw_path"])))
+        gt_labels = np.asarray(load_image(ck["label_path"]))
+
+        torch.cuda.empty_cache()
+        # One SAM skeleton reused for both runs; its encoder is overwritten per model in memory.
+        predictor = util.get_sam_model(model_type=ck["model_type"], device=device)
+
+        results = {}
+        for key, state in (("original", self._original_model_state), ("overfitted", finetuned_state)):
+            results[key] = _ais_from_state(predictor, state, raw_image, device, tile_shape, halo)
+            torch.cuda.empty_cache()
+
+        out_path = os.path.join(out_dir, "overfit_comparison.png")
+        _save_comparison_figure(raw_image, gt_labels, results, out_path, ck["model_type"])
+        print(f"[overfit-comparison] saved before/after figure to: {out_path}")
+
+
 def overfit_single_image(
     raw_path: Union[str, os.PathLike],
     label_path: Union[str, os.PathLike],
@@ -141,6 +305,10 @@ def overfit_single_image(
     mixed_precision: bool = True,
     num_workers: int = 0,
     spike_image_threshold: float = 1.0,
+    full_image_comparison: bool = True,
+    comparison_dir: Optional[str] = None,
+    comparison_tile_shape=(512, 512),
+    comparison_halo=(64, 64),
 ) -> Dict:
     """Train on one image (no augmentation, validation == train) via DefaultTrainer.
 
@@ -168,6 +336,14 @@ def overfit_single_image(
         num_workers: DataLoader workers per process.
         spike_image_threshold: Also log input/target/prediction to a ``*_spike/`` tag whenever the
             train/val loss exceeds this value (helps diagnose loss spikes off the periodic interval).
+        full_image_comparison: After training, segment the *whole* image with the original and the
+            overfitted model (both from in-memory weights, no checkpoint reload) and save a
+            before/after figure. Runs on rank 0 only, so it is safe under DDP.
+        comparison_dir: Directory for the comparison figure, written as
+            ``<comparison_dir>/overfit_comparison.png``. Defaults to this run's TensorBoard log
+            dir (``<save_root>/logs/<name>``), so the figure sits next to the overfit logs.
+        comparison_tile_shape: Tile shape for the whole-image AIS inference. Default ``(512, 512)``.
+        comparison_halo: Per-tile overlap (halo) for stitching. Default ``(64, 64)``.
 
     Returns:
         Dict with best_metric, latest_metric, passed, name and log_dir.
@@ -187,6 +363,15 @@ def overfit_single_image(
     mode = (f"multi-GPU DDP ({torch.cuda.device_count()} GPUs)" if multi_gpu else "single process")
     print(f"Overfit sanity check on:\n  raw:   {raw_path}\n  label: {label_path}\n"
           f"  mode: {mode}\n  mixed_precision: {mixed_precision}\n  tensorboard log_dir: {log_dir}")
+
+    # Forwarded to OverfitComparisonTrainer (picklable for mp.spawn); drives the before/after
+    # whole-image segmentation run on rank 0 after training.
+    comparison_kwargs = dict(
+        run_comparison=full_image_comparison,
+        raw_path=str(raw_path), label_path=str(label_path), model_type=model_type,
+        figure_dir=comparison_dir or log_dir,  # default: alongside this run's TensorBoard logs
+        tile_shape=tuple(comparison_tile_shape), halo=tuple(comparison_halo),
+    )
 
     if multi_gpu:
         # Reuse the exact model factory and DDP wiring the cross-validation script uses.
@@ -216,8 +401,9 @@ def overfit_single_image(
             find_unused_parameters=False,
             optimizer_callable=torch.optim.AdamW,
             optimizer_kwargs=dict(lr=lr),
-            # trainer params (forwarded to DefaultTrainer via **kwargs)
-            trainer_callable=torch_em.trainer.DefaultTrainer,
+            # trainer params (forwarded to OverfitComparisonTrainer via **kwargs)
+            trainer_callable=OverfitComparisonTrainer,
+            comparison_kwargs=comparison_kwargs,  # rank 0 runs the before/after whole-image figure
             logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
             logger_kwargs=dict(spike_image_threshold=spike_image_threshold),
             name=name,
@@ -246,7 +432,7 @@ def overfit_single_image(
 
         model = _build_model(model_type, encoder, decoder, device)
 
-        trainer = torch_em.trainer.DefaultTrainer(
+        trainer = OverfitComparisonTrainer(
             name=name,
             model=model,
             train_loader=train_loader,
@@ -262,6 +448,7 @@ def overfit_single_image(
             early_stopping=None,  # we want to watch it overfit, not stop early
             save_root=save_root,
             compile_model=False,
+            comparison_kwargs=comparison_kwargs,  # rank is None -> runs the before/after figure
         )
         trainer.fit(iterations=n_iterations)
 
@@ -327,6 +514,16 @@ def main():
     parser.add_argument("--spike-image-threshold", type=float, default=1.0,
                         help="Also log input/target/prediction to a *_spike/ tag whenever the train/val "
                              "loss exceeds this value (DiceBasedDistanceLoss ranges ~0-3).")
+    parser.add_argument("--full-image-comparison", action=argparse.BooleanOptionalAction, default=True,
+                        help="After training, segment the whole image with the original and overfitted "
+                             "model (in-memory) and save a before/after figure. --no-full-image-comparison to skip.")
+    parser.add_argument("--comparison-dir", default=None,
+                        help="Directory for the comparison figure (<dir>/overfit_comparison.png). "
+                             "Default: the run's TensorBoard log dir (<save-root>/logs/<name>).")
+    parser.add_argument("--comparison-tile-shape", type=int, nargs=2, default=[512, 512],
+                        help="Tile shape for the whole-image AIS comparison inference.")
+    parser.add_argument("--comparison-halo", type=int, nargs=2, default=[64, 64],
+                        help="Per-tile overlap (halo) for the whole-image AIS comparison inference.")
     args = parser.parse_args()
 
     overfit_single_image(
@@ -338,6 +535,8 @@ def main():
         save_root=args.save_root, name=args.name,
         multi_gpu=args.multi_gpu, mixed_precision=args.mixed_precision, num_workers=args.num_workers,
         spike_image_threshold=args.spike_image_threshold,
+        full_image_comparison=args.full_image_comparison, comparison_dir=args.comparison_dir,
+        comparison_tile_shape=tuple(args.comparison_tile_shape), comparison_halo=tuple(args.comparison_halo),
     )
 
 
