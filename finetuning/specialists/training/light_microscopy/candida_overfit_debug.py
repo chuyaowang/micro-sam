@@ -230,11 +230,16 @@ class OverfitComparisonTrainer(torch_em.trainer.DefaultTrainer):
     safe under ``train_multi_gpu`` (``mp.spawn``) and needs no checkpoint reload or model export.
     """
 
-    def __init__(self, *args, comparison_kwargs=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._comparison_kwargs = comparison_kwargs or {}
+    def __init__(self, comparison_kwargs=None, **kwargs):
+        # No *args: DefaultTrainer's checkpoint serializer (_build_init) introspects this
+        # signature and a VAR_POSITIONAL "args" param has no matching attribute to dump. Storing
+        # self._kwargs (required for the **kwargs branch) and self.comparison_kwargs (a dict the
+        # default Serializer can dump by name) keeps the trainer checkpoint-serializable.
+        super().__init__(**kwargs)
+        self._kwargs = kwargs
+        self.comparison_kwargs = comparison_kwargs or {}
         self._original_model_state = None
-        if self._comparison_kwargs.get("run_comparison", True) and getattr(self, "rank", None) in (None, 0):
+        if self.comparison_kwargs.get("run_comparison", True) and getattr(self, "rank", None) in (None, 0):
             raw_model = getattr(self.model, "module", self.model)  # unwrap DDP
             # CPU snapshot so the original weights survive training without holding GPU memory.
             self._original_model_state = OrderedDict(
@@ -255,7 +260,7 @@ class OverfitComparisonTrainer(torch_em.trainer.DefaultTrainer):
     def _run_full_image_comparison(self):
         from micro_sam import util
 
-        ck = self._comparison_kwargs
+        ck = self.comparison_kwargs
         tile_shape = ck.get("tile_shape", (512, 512))
         halo = ck.get("halo", (64, 64))
         out_dir = ck.get("figure_dir") or "."
