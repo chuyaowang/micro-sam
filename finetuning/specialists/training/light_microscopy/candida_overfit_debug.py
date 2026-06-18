@@ -240,6 +240,14 @@ def compare_full_image(
         print(f"[overfit-comparison] skipped: no checkpoint at {best_checkpoint}")
         return None
 
+    # best.pt embeds the validation dataset, whose transform is this module's _no_augmentation.
+    # The overfit ran as a script (__main__), so it was pickled as __main__._no_augmentation;
+    # register it on __main__ here so torch.load resolves it when run from another __main__
+    # (e.g. a notebook). This is the only script-local symbol the checkpoint references.
+    import __main__
+    if not hasattr(__main__, "_no_augmentation"):
+        __main__._no_augmentation = _no_augmentation
+
     device = get_device(device)
     is_tiled = tile_shape is not None
     raw_image = _to_channels_last(np.asarray(load_image(raw_path)))
