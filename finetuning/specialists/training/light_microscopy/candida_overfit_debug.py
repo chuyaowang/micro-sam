@@ -142,6 +142,32 @@ def _to_channels_last(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
+def _strip_ddp_prefix(checkpoint_path, figure_dir):
+    """Return a checkpoint whose ``model_state`` keys have no ``module.`` (DDP) prefix.
+
+    A ``--multi-gpu`` overfit run trains a ``DistributedDataParallel``-wrapped model, so
+    ``DefaultTrainer`` saves ``self.model.state_dict()`` with every key prefixed ``module.``
+    (e.g. ``module.encoder.pos_embed``). ``export_instance_segmentation_model`` filters for keys
+    starting with ``encoder`` and would miss them, raising ``KeyError: 'encoder.pos_embed'``.
+
+    If the checkpoint carries the prefix, write a normalized copy into ``figure_dir`` (stripping the
+    prefix from ``model_state`` only) and return its path. Single-GPU checkpoints have no prefix, so
+    the original path is returned unchanged (no copy).
+    """
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model_state = state.get("model_state", None)
+    if model_state is None or not all(k.startswith("module.") for k in model_state):
+        return checkpoint_path
+    from collections import OrderedDict
+    state["model_state"] = OrderedDict(
+        (k[len("module."):], v) for k, v in model_state.items()
+    )
+    normalized_path = os.path.join(figure_dir, "overfit_best_no_ddp.pt")
+    torch.save(state, normalized_path)
+    print(f"[overfit-comparison] stripped DDP 'module.' prefix from checkpoint -> {normalized_path}")
+    return normalized_path
+
+
 def _load_predictor_and_segmenter(model_type, checkpoint_path, decoder_path, device, is_tiled):
     """Build a SAM predictor + AIS segmenter from saved weights (mirrors get_predictor_and_segmenter).
 
@@ -254,10 +280,13 @@ def compare_full_image(
     gt_labels = np.asarray(load_image(label_path))
 
     # Export the overfit checkpoint into an AIS-ready model (image encoder remapped + decoder_state).
+    # A --multi-gpu run saved a DDP-wrapped model, so first strip any 'module.' prefix that would
+    # otherwise make export_instance_segmentation_model's encoder filter miss every weight.
     os.makedirs(figure_dir, exist_ok=True)
+    normalized_checkpoint = _strip_ddp_prefix(best_checkpoint, figure_dir)
     export_path = os.path.join(figure_dir, "overfit_export.pth")
     sam_training.export_instance_segmentation_model(
-        trained_model_path=best_checkpoint, output_path=export_path,
+        trained_model_path=normalized_checkpoint, output_path=export_path,
         model_type=model_type, initial_checkpoint_path=encoder,
     )
 
@@ -277,6 +306,8 @@ def compare_full_image(
 
     if os.path.exists(export_path):
         os.remove(export_path)  # ~400 MB; the figure is what we keep
+    if normalized_checkpoint != best_checkpoint and os.path.exists(normalized_checkpoint):
+        os.remove(normalized_checkpoint)  # temp DDP-stripped copy; best.pt stays untouched
 
     out_path = os.path.join(figure_dir, "overfit_comparison.png")
     _save_comparison_figure(raw_image, gt_labels, results, out_path, model_type)
