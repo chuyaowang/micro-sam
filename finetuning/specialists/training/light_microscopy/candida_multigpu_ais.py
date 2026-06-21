@@ -41,6 +41,7 @@ Example (Kaggle, 2x T4, internet on, fork installed via ``pip install -e``)::
 
 import os
 import glob
+import shutil
 import argparse
 import statistics
 from typing import List, Optional, Tuple
@@ -192,6 +193,84 @@ def fixed_crop_val_dataset(**kwargs):
     )
 
 
+def _no_augmentation(raw, labels):
+    """Identity transform: disable all augmentation on the validation tiles.
+
+    ``default_sam_dataset`` substitutes the default (flip + 90-degree rotation) pipeline when
+    ``transform is None``, so the deterministic validation tiles would still be randomly
+    rotated/flipped unless an explicit no-op is supplied. Kept at module level (not a lambda)
+    so it survives the ``mp.spawn`` pickle on the DDP worker path.
+    """
+    return raw, labels
+
+
+def _grid_slices(raw: np.ndarray, patch_shape) -> List[Tuple[slice, slice]]:
+    """Return spatial slices for every full, non-overlapping ``patch_shape`` tile of ``raw``.
+
+    Edge remainders smaller than ``patch_shape`` are dropped so each tile is exactly the patch
+    size (the dataset's own random crop then becomes a no-op). Channel layout is detected with
+    the same ``shape[-1] > 16`` heuristic as ``_best_variance_patch``.
+    """
+    pH, pW = int(patch_shape[-2]), int(patch_shape[-1])
+    if raw.ndim == 3 and raw.shape[-1] > 16:      # channel-first (C, H, W)
+        H, W = raw.shape[1], raw.shape[2]
+    elif raw.ndim == 3:                           # channel-last (H, W, C)
+        H, W = raw.shape[0], raw.shape[1]
+    else:                                         # (H, W)
+        H, W = raw.shape
+    slices = []
+    for iy in range(max(1, H // pH)):
+        for ix in range(max(1, W // pW)):
+            y0, x0 = iy * pH, ix * pW
+            slices.append((slice(y0, y0 + pH), slice(x0, x0 + pW)))
+    return slices
+
+
+def tiled_val_dataset(**kwargs):
+    """Validation dataset that deterministically covers the WHOLE image with a tile grid.
+
+    Drop-in replacement for ``default_sam_dataset`` as the validation dataset callable. Each
+    image is split into all full, non-overlapping ``patch_shape`` tiles -- background-heavy,
+    cell-heavy and balanced alike -- so the validation metric is representative of every region
+    type, not just one cell-rich patch. With augmentation disabled (the caller passes
+    ``transform=_no_augmentation``) and the loader's ``shuffle`` off under DDP, every tile is
+    visited once per validation pass, so the metric is both representative and reproducible. The
+    instance ``sampler`` is dropped so empty/background tiles are kept (they test the model's
+    ability to predict empty masks).
+    """
+    raw_paths = kwargs.pop("raw_paths")
+    label_paths = kwargs.pop("label_paths")
+    kwargs.pop("raw_key", None)
+    kwargs.pop("label_key", None)
+    kwargs.pop("sampler", None)
+    patch_shape = kwargs["patch_shape"]
+
+    if not isinstance(raw_paths, (list, tuple)):
+        raw_paths, label_paths = [raw_paths], [label_paths]
+
+    raw_tiles, label_tiles = [], []
+    for rp, lp in zip(raw_paths, label_paths):
+        raw = np.asarray(load_image(rp))
+        label = np.asarray(load_image(lp))
+        channel_first = raw.ndim == 3 and raw.shape[-1] > 16
+        for sy, sx in _grid_slices(raw, patch_shape):
+            if channel_first:
+                raw_tiles.append(raw[:, sy, sx])
+            elif raw.ndim == 3:
+                raw_tiles.append(raw[sy, sx, :])
+            else:
+                raw_tiles.append(raw[sy, sx])
+            label_tiles.append(label[sy, sx])
+
+    # One sample per tile so a validation pass covers the whole image exactly once.
+    kwargs.setdefault("n_samples", len(raw_tiles))
+    return default_sam_dataset(
+        raw_paths=raw_tiles, raw_key=None,
+        label_paths=label_tiles, label_key=None,
+        sampler=None, **kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Augmentation (module-level so it survives the mp.spawn re-import / pickle).
 # Mirrors the notebook's SplitPhotometricPipeline: geometric augs are applied to
@@ -303,9 +382,191 @@ def make_fold(
 
 
 # ---------------------------------------------------------------------------
+# Held-out before/after comparison (runs in the main process after each fold,
+# independent of the DDP workers). Loads the original model from the saved
+# encoder/decoder weights and the fine-tuned model from the fold's best.pt,
+# runs whole-image AIS on the held-out image, scores both with mean
+# segmentation accuracy, and saves a 2x6 before/after figure.
+# ---------------------------------------------------------------------------
+def _to_channels_last(image: np.ndarray) -> np.ndarray:
+    """Channels-first ``(C, H, W)`` -> ``(H, W, C)``; leave grayscale / channels-last as-is.
+
+    ``micro_sam.util._to_image`` treats the *last* axis as channels, so the pre-processed
+    channels-first raw tiff must be transposed before inference.
+    """
+    if image.ndim == 3 and image.shape[-1] > 16:  # (C, H, W): last axis is spatial -> channels first
+        return np.ascontiguousarray(np.transpose(image, (1, 2, 0)))
+    return np.ascontiguousarray(image)
+
+
+def _strip_ddp_prefix(checkpoint_path, out_dir):
+    """Return a checkpoint whose ``model_state`` keys have no ``module.`` (DDP) prefix.
+
+    ``train_multi_gpu`` trains a ``DistributedDataParallel``-wrapped model, so ``best.pt``'s
+    ``model_state`` keys are prefixed ``module.`` (e.g. ``module.encoder.pos_embed``).
+    ``export_instance_segmentation_model`` filters for keys starting with ``encoder`` and would
+    miss them. If the prefix is present, write a stripped copy into ``out_dir`` and return its
+    path; otherwise return the original path unchanged (no copy).
+    """
+    from collections import OrderedDict
+
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model_state = state.get("model_state", None)
+    if model_state is None or not all(k.startswith("module.") for k in model_state):
+        return checkpoint_path
+    state["model_state"] = OrderedDict((k[len("module."):], v) for k, v in model_state.items())
+    normalized_path = os.path.join(out_dir, "_cv_best_no_ddp.pt")
+    torch.save(state, normalized_path)
+    return normalized_path
+
+
+def _load_predictor_and_segmenter(model_type, checkpoint_path, decoder_path, device, is_tiled):
+    """Build a SAM predictor + AIS segmenter from saved weights."""
+    from micro_sam import util
+    from micro_sam.instance_segmentation import get_decoder, get_instance_segmentation_generator
+
+    predictor, state = util.get_sam_model(
+        model_type=model_type, checkpoint_path=checkpoint_path, device=device, return_state=True,
+    )
+    if decoder_path is not None:
+        decoder_state = torch.load(decoder_path, map_location=device, weights_only=False)
+    elif "decoder_state" in state:
+        decoder_state = state["decoder_state"]
+    else:
+        raise RuntimeError(
+            f"No decoder weights: checkpoint '{checkpoint_path}' has no 'decoder_state' and no "
+            "decoder_path was given."
+        )
+    decoder = get_decoder(predictor.model.image_encoder, decoder_state, device)
+    segmenter = get_instance_segmentation_generator(predictor=predictor, is_tiled=is_tiled, decoder=decoder)
+    return predictor, segmenter
+
+
+def _run_ais(predictor, segmenter, image, tile_shape, halo) -> dict:
+    """Run whole-image AIS and return the instance map plus the decoder's three output maps."""
+    from micro_sam import util
+
+    is_tiled = tile_shape is not None
+    image_embeddings = util.precompute_image_embeddings(
+        predictor=predictor, input_=image, ndim=2, tile_shape=tile_shape, halo=halo,
+    )
+    init_kwargs = dict(image=image, image_embeddings=image_embeddings)
+    # output_mode="instance_segmentation" returns the label image directly.
+    generate_kwargs = {"output_mode": "instance_segmentation"}
+    if is_tiled:
+        init_kwargs["batch_size"] = 1
+        generate_kwargs.update(tile_shape=tile_shape, halo=halo)
+    segmenter.initialize(**init_kwargs)
+    instances = segmenter.generate(**generate_kwargs)
+    state = segmenter.get_state()
+    return {
+        "instances": instances,
+        "foreground": state["foreground"],
+        "center_distances": state["center_distances"],
+        "boundary_distances": state["boundary_distances"],
+    }
+
+
+def _save_comparison_figure(raw_image, gt_labels, results, msa, out_path, model_type, stem):
+    """2x6 grid: rows = (Original, Fine-tuned); cols = Raw, GT, Instances, Foreground, Center, Boundary."""
+    import matplotlib
+    matplotlib.use("Agg")  # headless: no interactive display in the training process
+    import matplotlib.pyplot as plt
+    from torch_em.util.util import get_random_colors
+
+    disp_raw = raw_image if raw_image.ndim == 2 else raw_image[..., :3]
+    col_titles = ["Raw", "Ground truth", "Instances", "Foreground prob", "Center distance", "Boundary distance"]
+    fig, axes = plt.subplots(2, 6, figsize=(28, 9))
+    for r, key in enumerate(("original", "finetuned")):
+        res = results[key]
+        inst = res["instances"]
+        axes[r, 0].imshow(disp_raw, cmap="gray" if disp_raw.ndim == 2 else None)
+        axes[r, 0].set_ylabel(f"{key.capitalize()}\nmSA={msa[key]:.3f}", fontsize=12)
+        axes[r, 1].imshow(gt_labels, cmap=get_random_colors(gt_labels), interpolation="nearest")
+        axes[r, 2].imshow(inst, cmap=get_random_colors(inst), interpolation="nearest")
+        axes[r, 3].imshow(res["foreground"], cmap="viridis")
+        axes[r, 4].imshow(res["center_distances"], cmap="magma")
+        axes[r, 5].imshow(res["boundary_distances"], cmap="magma")
+        axes[r, 2].set_title(f"Instances (n={int(inst.max())})")
+        for c in range(6):
+            axes[r, c].set_xticks([])
+            axes[r, c].set_yticks([])
+        if r == 0:
+            for c in (0, 1, 3, 4, 5):
+                axes[r, c].set_title(f"Ground truth (n={int(gt_labels.max())})" if c == 1 else col_titles[c])
+    fig.suptitle(f"Held-out before/after - {stem} - {model_type}", fontsize=15)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+def compare_held_out(
+    raw_path, label_path, model_type, encoder, decoder, best_checkpoint, figure_dir,
+    device=None, tile_shape=(512, 512), halo=(64, 64),
+):
+    """Segment the held-out image with the original and fine-tuned model; save figure, return mSA.
+
+    Exports the fold's ``best.pt`` to an AIS-ready model (DDP prefix stripped + image encoder
+    remapped + ``decoder_state``), runs tiled whole-image AIS with both the original
+    (encoder/decoder) and fine-tuned model, scores each against the ground truth with mean
+    segmentation accuracy, and writes a 2x6 before/after figure. Returns
+    ``{"original": msa, "finetuned": msa}`` (or None if the checkpoint is missing).
+    """
+    import micro_sam.training as sam_training
+    from micro_sam.util import get_device
+    from elf.evaluation import mean_segmentation_accuracy
+
+    if not os.path.exists(best_checkpoint):
+        print(f"[cv-comparison] skipped: no checkpoint at {best_checkpoint}")
+        return None
+
+    device = get_device(device)
+    is_tiled = tile_shape is not None
+    raw_image = _to_channels_last(np.asarray(load_image(raw_path)))
+    gt_labels = np.asarray(load_image(label_path))
+    os.makedirs(figure_dir, exist_ok=True)
+
+    # Export the fine-tuned model (strip DDP prefix first so the encoder filter matches).
+    trained_path = _strip_ddp_prefix(best_checkpoint, figure_dir)
+    export_path = os.path.join(figure_dir, "_cv_export.pth")
+    sam_training.export_instance_segmentation_model(
+        trained_model_path=trained_path, output_path=export_path,
+        model_type=model_type, initial_checkpoint_path=encoder,
+    )
+    if trained_path != best_checkpoint and os.path.exists(trained_path):
+        os.remove(trained_path)
+
+    results, msa = {}, {}
+    runs = (
+        ("original", encoder, decoder),     # saved pretrained weights (decoder is a separate file)
+        ("finetuned", export_path, None),   # exported best.pt (decoder lives inside the checkpoint)
+    )
+    for key, checkpoint_path, decoder_path in runs:
+        predictor, segmenter = _load_predictor_and_segmenter(
+            model_type, checkpoint_path, decoder_path, device, is_tiled,
+        )
+        results[key] = _run_ais(predictor, segmenter, raw_image, tile_shape, halo)
+        msa[key] = float(mean_segmentation_accuracy(results[key]["instances"], gt_labels))
+        del predictor, segmenter
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if os.path.exists(export_path):
+        os.remove(export_path)  # ~400 MB; the figure + mSA are what we keep
+
+    stem = os.path.splitext(os.path.basename(str(raw_path)))[0]
+    out_path = os.path.join(figure_dir, f"comparison_{stem}.png")
+    _save_comparison_figure(raw_image, gt_labels, results, msa, out_path, model_type, stem)
+    print(f"[cv-comparison] {stem}: mSA original={msa['original']:.4f} -> finetuned={msa['finetuned']:.4f}")
+    print(f"[cv-comparison] saved figure to: {out_path}")
+    return msa
+
+
+# ---------------------------------------------------------------------------
 # Training driver.
 # ---------------------------------------------------------------------------
-def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> Optional[float]:
+def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> dict:
     """Run one DDP training session for a single fold. Returns the fold's best metric."""
     raw_train, label_train, raw_val, label_val = make_fold(raw_paths, label_paths, args.n_folds, fold)
 
@@ -331,9 +592,11 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         raw_paths=raw_train, label_paths=label_train,
         is_train=True, transform=build_train_transform(), **shared_ds_kwargs,
     )
+    # Validation covers the whole held-out image with a deterministic tile grid (all region
+    # types), augmentation disabled, so the metric is representative and reproducible.
     val_dataset_kwargs = dict(
         raw_paths=raw_val, label_paths=label_val,
-        is_train=False, **shared_ds_kwargs,
+        is_train=False, transform=_no_augmentation, **shared_ds_kwargs,
     )
 
     loader_kwargs = dict(
@@ -359,7 +622,7 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         ),
         train_dataset_callable=default_sam_dataset,
         train_dataset_kwargs=train_dataset_kwargs,
-        val_dataset_callable=fixed_crop_val_dataset,  # fixed cell-rich patch (see fixed_crop_val_dataset)
+        val_dataset_callable=tiled_val_dataset,  # deterministic whole-image tile grid (see tiled_val_dataset)
         val_dataset_kwargs=val_dataset_kwargs,
         loader_kwargs=loader_kwargs,
         iterations=int(args.iterations),
@@ -385,16 +648,50 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> O
         compile_model=False,
     )
 
-    # Read back the fold's best validation metric from the saved checkpoint.
-    best_ckpt = os.path.join(
-        "" if args.save_root is None else args.save_root, "checkpoints", name, "best.pt",
-    )
+    # Everything below runs in the main process after the DDP workers have exited.
+    save_root = "" if args.save_root is None else args.save_root
+    ckpt_dir = os.path.join(save_root, "checkpoints", name)
+    best_ckpt = os.path.join(ckpt_dir, "best.pt")
+    log_dir = os.path.join(save_root, "logs", name)
+
+    # Read the fold's best (tiled-val) metric back before any checkpoint cleanup.
+    best_metric = None
     if os.path.exists(best_ckpt):
         best_metric = torch.load(best_ckpt, map_location="cpu", weights_only=False).get("best_metric")
-        print(f"Fold {fold}: best metric = {best_metric:.6f}")
-        return best_metric
-    print(f"Fold {fold}: no best.pt found at {best_ckpt}")
-    return None
+        print(f"Fold {fold}: best tiled-val metric = {best_metric:.6f}")
+    else:
+        print(f"Fold {fold}: no best.pt found at {best_ckpt}")
+
+    # Before/after whole-image AIS on the held-out image(s): figure + mean segmentation accuracy.
+    msa_original, msa_finetuned = [], []
+    if not args.no_comparison:
+        for rp, lp in zip(raw_val, label_val):
+            try:
+                m = compare_held_out(
+                    raw_path=rp, label_path=lp, model_type=args.model_type,
+                    encoder=args.encoder, decoder=args.decoder, best_checkpoint=best_ckpt,
+                    figure_dir=log_dir,
+                    tile_shape=tuple(args.comparison_tile_shape), halo=tuple(args.comparison_halo),
+                )
+            except Exception as e:
+                import traceback
+                print(f"[cv-comparison] skipped for {os.path.basename(rp)}: {e}")
+                traceback.print_exc()
+                m = None
+            if m is not None:
+                msa_original.append(m["original"])
+                msa_finetuned.append(m["finetuned"])
+
+    # Models are not needed -- keep only the logs and the comparison figures.
+    if not args.keep_checkpoints and os.path.isdir(ckpt_dir):
+        shutil.rmtree(ckpt_dir)
+        print(f"Fold {fold}: removed checkpoints ({ckpt_dir}); kept logs + figures.")
+
+    return {
+        "best_metric": best_metric,
+        "msa_original": statistics.mean(msa_original) if msa_original else None,
+        "msa_finetuned": statistics.mean(msa_finetuned) if msa_finetuned else None,
+    }
 
 
 def main():
@@ -425,6 +722,15 @@ def main():
                         help="Model parts to freeze (e.g. image_encoder). Default: nothing frozen (encoder trained).")
     parser.add_argument("--flexible-decoder-loading", action="store_true",
                         help="Allow loading a decoder with mismatched output channels (reinitializes them).")
+    parser.add_argument("--keep-checkpoints", action="store_true",
+                        help="Keep each fold's checkpoints/ dir. Default: delete it after the comparison "
+                             "figure is made, keeping only logs/ and the figures.")
+    parser.add_argument("--no-comparison", action="store_true",
+                        help="Skip the per-fold held-out before/after AIS figure and mSA scoring.")
+    parser.add_argument("--comparison-tile-shape", type=int, nargs=2, default=[512, 512],
+                        help="Tile shape for the whole-image held-out AIS comparison inference.")
+    parser.add_argument("--comparison-halo", type=int, nargs=2, default=[64, 64],
+                        help="Per-tile overlap (halo) for the whole-image held-out AIS comparison inference.")
     args = parser.parse_args()
 
     if torch.cuda.device_count() < 1:
@@ -444,17 +750,27 @@ def main():
     for fold in folds:
         results[fold] = run_fold(args, fold, raw_paths, label_paths)
 
-    # Cross-validation summary.
-    valid = [m for m in results.values() if m is not None]
-    print(f"\n{'=' * 70}\nCross-validation summary ({len(valid)}/{len(folds)} folds completed)")
+    # Cross-validation summary: held-out mean segmentation accuracy (before -> after fine-tuning),
+    # plus the tiled-val loss. mSA is the interpretable headline metric (higher is better).
+    def _fmt(v, p=4):
+        return "n/a" if v is None else f"{v:.{p}f}"
+
+    finetuned_msa = [r["msa_finetuned"] for r in results.values() if r["msa_finetuned"] is not None]
+    original_msa = [r["msa_original"] for r in results.values() if r["msa_original"] is not None]
+
+    print(f"\n{'=' * 78}\nCross-validation summary ({len(folds)} folds)")
+    print(f"  {'fold':>4}  {'mSA original':>13}  {'mSA finetuned':>13}  {'tiled-val loss':>14}")
     for fold in folds:
-        m = results[fold]
-        print(f"  fold {fold}: {'n/a' if m is None else f'{m:.6f}'}")
-    if len(valid) >= 1:
-        mean = statistics.mean(valid)
-        std = statistics.stdev(valid) if len(valid) > 1 else 0.0
-        print(f"  mean +/- std: {mean:.6f} +/- {std:.6f}  (lower is better)")
-    print("=" * 70)
+        r = results[fold]
+        print(f"  {fold:>4}  {_fmt(r['msa_original']):>13}  {_fmt(r['msa_finetuned']):>13}  "
+              f"{_fmt(r['best_metric'], 6):>14}")
+    if finetuned_msa:
+        o_mean = statistics.mean(original_msa) if original_msa else float("nan")
+        f_mean = statistics.mean(finetuned_msa)
+        f_std = statistics.stdev(finetuned_msa) if len(finetuned_msa) > 1 else 0.0
+        print(f"\n  held-out mSA (higher is better): "
+              f"original {o_mean:.4f} -> finetuned {f_mean:.4f} +/- {f_std:.4f}")
+    print("=" * 78)
 
 
 if __name__ == "__main__":
