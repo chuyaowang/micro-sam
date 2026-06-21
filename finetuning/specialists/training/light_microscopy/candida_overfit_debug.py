@@ -197,7 +197,7 @@ def _load_predictor_and_segmenter(model_type, checkpoint_path, decoder_path, dev
 
 
 def _run_ais(predictor, segmenter, image, tile_shape, halo):
-    """Run whole-image AIS and return ``(instances, foreground)``."""
+    """Run whole-image AIS and return the instance map plus the decoder's three output maps."""
     from micro_sam import util
 
     is_tiled = tile_shape is not None
@@ -213,33 +213,42 @@ def _run_ais(predictor, segmenter, image, tile_shape, halo):
         generate_kwargs.update(tile_shape=tile_shape, halo=halo)
     segmenter.initialize(**init_kwargs)
     instances = segmenter.generate(**generate_kwargs)
-    foreground = segmenter.get_state()["foreground"]
-    return instances, foreground
+    state = segmenter.get_state()
+    return {
+        "instances": instances,
+        "foreground": state["foreground"],
+        "center_distances": state["center_distances"],
+        "boundary_distances": state["boundary_distances"],
+    }
 
 
 def _save_comparison_figure(raw_image, gt_labels, results, out_path, model_type):
-    """2x4 grid: rows = (Original, Overfitted); cols = Raw, Ground truth, Instances, Foreground."""
+    """2x6 grid: rows = (Original, Overfitted); cols = Raw, GT, Instances, Foreground, Center, Boundary."""
     import matplotlib
     matplotlib.use("Agg")  # headless: no interactive display in the training subprocess
     import matplotlib.pyplot as plt
     from torch_em.util.util import get_random_colors
 
     disp_raw = raw_image if raw_image.ndim == 2 else raw_image[..., :3]
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    col_titles = ["Raw", "Ground truth", "Instances", "Foreground prob", "Center distance", "Boundary distance"]
+    fig, axes = plt.subplots(2, 6, figsize=(28, 9))
     for r, key in enumerate(("original", "overfitted")):
-        instances, foreground = results[key]
+        res = results[key]
+        inst = res["instances"]
         axes[r, 0].imshow(disp_raw, cmap="gray" if disp_raw.ndim == 2 else None)
         axes[r, 0].set_ylabel(key.capitalize(), fontsize=14)
-        axes[r, 0].set_title("Raw" if r == 0 else "")
         axes[r, 1].imshow(gt_labels, cmap=get_random_colors(gt_labels), interpolation="nearest")
-        axes[r, 1].set_title(f"Ground truth (n={int(gt_labels.max())})" if r == 0 else "")
-        axes[r, 2].imshow(instances, cmap=get_random_colors(instances), interpolation="nearest")
-        axes[r, 2].set_title(f"Instances (n={int(instances.max())})")
-        axes[r, 3].imshow(foreground, cmap="viridis")
-        axes[r, 3].set_title("Foreground prob")
-        for c in range(4):
+        axes[r, 2].imshow(inst, cmap=get_random_colors(inst), interpolation="nearest")
+        axes[r, 3].imshow(res["foreground"], cmap="viridis")
+        axes[r, 4].imshow(res["center_distances"], cmap="magma")
+        axes[r, 5].imshow(res["boundary_distances"], cmap="magma")
+        axes[r, 2].set_title(f"Instances (n={int(inst.max())})")
+        for c in range(6):
             axes[r, c].set_xticks([])
             axes[r, c].set_yticks([])
+        if r == 0:
+            for c in (0, 1, 3, 4, 5):
+                axes[r, c].set_title(f"Ground truth (n={int(gt_labels.max())})" if c == 1 else col_titles[c])
     fig.suptitle(f"Overfit before/after - {model_type}", fontsize=16)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
