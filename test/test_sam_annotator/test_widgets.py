@@ -33,8 +33,8 @@ def test_embedding_widget(make_napari_viewer, tmp_path):
     layer = viewer.open_sample("napari", "camera")[0]
     my_widget = EmbeddingWidget()
 
-    # Set the widget parameters
-    my_widget.image = layer
+    # Set the widget parameters (select the image as channel 1; channels 2 and 3 stay empty).
+    my_widget.channel_selections[0].value = layer
     my_widget.model_type = "vit_t"
     my_widget.device = "cpu"
     my_widget.embeddings_save_path = tmp_path

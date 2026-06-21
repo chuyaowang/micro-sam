@@ -205,9 +205,9 @@ class ObjectClassifier(QtWidgets.QScrollArea):
     def _create_widgets(self):
         # Create the embedding widget and connect all events related to it.
         self._embedding_widget = widgets.EmbeddingWidget()
-        # Connect events for the image selection box.
-        self._viewer.layers.events.inserted.connect(self._embedding_widget.image_selection.reset_choices)
-        self._viewer.layers.events.removed.connect(self._embedding_widget.image_selection.reset_choices)
+        # Connect events for the channel selection boxes.
+        self._viewer.layers.events.inserted.connect(self._embedding_widget.reset_choices)
+        self._viewer.layers.events.removed.connect(self._embedding_widget.reset_choices)
         # Connect the run button with the function to update the image.
         self._embedding_widget.run_button.clicked.connect(self._update_image)
 

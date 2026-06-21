@@ -1184,33 +1184,89 @@ class EmbeddingWidget(_WidgetBase):
 
     def _initialize_image(self):
         state = AnnotatorState()
-        layer = self.image_selection.get_value()
 
         # This is encountered when there is no image layer available / selected.
         # In this case, we need not specify other image-level parameters to the state. Hence, we skip them.
         # NOTE: On code-level, this happens as the first step when "Compute Embedding" click is triggered.
-        if layer is None:
+        try:
+            assembled = self._get_assembled_image()
+        except ValueError:
+            return  # shape mismatch is surfaced as an error dialog in __call__
+        if assembled is None:
             return
 
-        image_shape = layer.data.shape
-        image_scale = tuple(layer.scale)
-        state.image_shape = image_shape
+        image_data, image_scale, image_name, ndim = assembled
+        # image_data may carry a trailing channel axis (multi-channel); image_shape excludes it.
+        state.image_shape = image_data.shape[:ndim]
         state.image_scale = image_scale
-        state.image_name = layer.name
+        state.image_name = image_name
 
     def _create_image_section(self):
         image_section = QtWidgets.QVBoxLayout()
-        image_layer_widget = QtWidgets.QLabel("Image Layer:")
-        # image_layer_widget.setToolTip(get_tooltip("embedding", "image")) #  this adds tooltip to label
-        image_section.addWidget(image_layer_widget)
+        image_section.addWidget(QtWidgets.QLabel("Image Channels:"))
 
+        # The model always runs on a 3-channel (RGB-style) image. Select one napari Image layer per
+        # channel. Channels 2 and 3 are optional: leave them empty (e.g. for 2-channel data) and
+        # they are filled with zeros. The channel order must match the order the model was trained
+        # on. A single selected channel is passed through unchanged (grayscale).
         # Setting a napari layer in QT, see:
         # https://github.com/pyapp-kit/magicgui/blob/main/docs/examples/napari/napari_combine_qt.py
-        self.image_selection = create_widget(annotation=napari.layers.Image)
-        self.image_selection.native.setToolTip(get_tooltip("embedding", "image"))
-        image_section.addWidget(self.image_selection.native)
+        self.channel_selections = []
+        for channel_idx, optional in enumerate((False, True, True)):
+            title = f"Channel {channel_idx + 1} (optional):" if optional else f"Channel {channel_idx + 1}:"
+            image_section.addWidget(QtWidgets.QLabel(title))
+            annotation = Optional[napari.layers.Image] if optional else napari.layers.Image
+            selector = create_widget(annotation=annotation)
+            selector.native.setToolTip(get_tooltip("embedding", "image"))
+            if optional:
+                selector.value = None  # default empty, so only channel 1 auto-selects a layer
+            image_section.addWidget(selector.native)
+            self.channel_selections.append(selector)
 
         return image_section
+
+    def reset_choices(self, *args):
+        """Refresh the layer choices of all channel selectors (on layer add/remove)."""
+        for selector in self.channel_selections:
+            selector.reset_choices()
+
+    def _get_assembled_image(self):
+        """Assemble the selected channel layers into a single image for the model.
+
+        Returns ``(image_data, scale, name, ndim)``, or None if no channel is selected. SAM always
+        runs on 3 channels: a single selected channel is returned unchanged (grayscale, replicated
+        downstream by ``_to_image``); 2-3 selected channels are stacked along a new last axis with
+        zeros for empty slots, giving ``(Y, X, 3)`` for a 2D image or ``(Z, Y, X, 3)`` for a
+        z-stack. ``ndim`` is the per-channel dimensionality (2 or 3), i.e. excluding the channel
+        axis, so it routes to the 2d/3d annotator correctly. Raises ValueError if the selected
+        channels do not share the same shape.
+        """
+        layers = [selector.get_value() for selector in self.channel_selections]
+        selected = [layer for layer in layers if layer is not None]
+        if not selected:
+            return None
+
+        reference = selected[0]
+        ref_shape = reference.data.shape
+        for layer in selected:
+            if layer.data.shape != ref_shape:
+                shapes = {layer.name: tuple(layer.data.shape) for layer in selected}
+                raise ValueError(f"All selected channels must have the same shape, but got: {shapes}.")
+
+        scale = tuple(reference.scale)
+        name = "+".join(layer.name for layer in selected)
+        ndim = reference.data.ndim
+
+        # Single channel: keep the previous behaviour (pass the grayscale image through unchanged).
+        if len(selected) == 1:
+            return np.asarray(reference.data), scale, name, ndim
+
+        # Multiple channels: stack channels-last, filling empty slots with zeros (reference dtype).
+        channels = [
+            np.zeros(ref_shape, dtype=reference.data.dtype) if layer is None else np.asarray(layer.data)
+            for layer in layers
+        ]
+        return np.stack(channels, axis=-1), scale, name, ndim
 
     def _update_model(self, state):
         _model_type = state.predictor.model_type if self.custom_weights else self.model_type
@@ -1318,7 +1374,7 @@ class EmbeddingWidget(_WidgetBase):
         settings = _make_collapsible(setting_values, title="Embedding Settings")
         return settings
 
-    def _validate_inputs(self):
+    def _validate_inputs(self, assembled):
         """Validates the inputs for the annotation process and returns a dictionary
         containing information for message generation, or False if no messages are needed.
 
@@ -1340,9 +1396,9 @@ class EmbeddingWidget(_WidgetBase):
         """
 
         # Check if we have an existing input image to compute the embeddings.
-        image = self.image_selection.get_value()
-        if image is None:
-            return _generate_message("error", "No image has been selected.")
+        if assembled is None:
+            return _generate_message("error", "No image channels have been selected.")
+        image_data = assembled[0]
 
         # Check if we have an existing embedding path.
         # If yes we check the data signature of these embeddings against the selected image
@@ -1361,8 +1417,7 @@ class EmbeddingWidget(_WidgetBase):
 
                 # Validate image data signature.
                 if "data_signature" in f.attrs:
-                    image = self.image_selection.get_value()
-                    img_signature = util._compute_data_signature(image.data)
+                    img_signature = util._compute_data_signature(image_data)
                     if img_signature != f.attrs["data_signature"]:
                         msg = f"The embeddings don't match with the image: {img_signature} {f.attrs['data_signature']}"
                         return _generate_message("error", msg)
@@ -1410,12 +1465,19 @@ class EmbeddingWidget(_WidgetBase):
     def __call__(self, skip_validate=False):
         self._validate_model_type_and_custom_weights()
 
+        # Assemble the selected channel layers into a single image for the model.
+        try:
+            assembled = self._get_assembled_image()
+        except ValueError as e:
+            return _generate_message("error", str(e))
+
         # Validate user inputs.
-        if not skip_validate and self._validate_inputs():
+        if not skip_validate and self._validate_inputs(assembled):
             return
 
-        # Get the image.
-        image = self.image_selection.get_value()
+        if assembled is None:
+            return
+        image_data, image_scale, image_name, ndim = assembled
 
         # Update the image embeddings:
         state = AnnotatorState()
@@ -1428,21 +1490,14 @@ class EmbeddingWidget(_WidgetBase):
         # Reset the state.
         state.reset_state()
 
-        # Get image dimensions.
-        if image.rgb:
-            ndim = image.data.ndim - 1
-            state.image_shape = image.data.shape[:-1]
-        else:
-            ndim = image.data.ndim
-            state.image_shape = image.data.shape
-
-        # Set layer scale
-        state.image_scale = tuple(image.scale)
+        # Set image dimensions and scale. image_data may carry a trailing channel axis
+        # (for multi-channel input); image_shape excludes it, and ndim is the per-channel value.
+        state.image_shape = image_data.shape[:ndim]
+        state.image_scale = image_scale
 
         # Process tile_shape and halo, set other data.
         tile_shape, halo = _process_tiling_inputs(self.tile_x, self.tile_y, self.halo_x, self.halo_y)
         save_path = None if self.embeddings_save_path == "" else self.embeddings_save_path
-        image_data = image.data
 
         # Set up progress bar and signals for using it within a threadworker.
         pbar, pbar_signals = _create_pbar_for_threadworker()
