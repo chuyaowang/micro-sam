@@ -40,6 +40,7 @@ Example (Kaggle, 2x T4, internet on, fork installed via ``pip install -e``)::
 """
 
 import os
+import csv
 import glob
 import shutil
 import argparse
@@ -595,6 +596,50 @@ def compare_held_out(
 
 
 # ---------------------------------------------------------------------------
+# Persist per-fold results so the mSA / val-loss numbers survive the
+# one-fold-per-subprocess workflow (each fold appends its own row).
+# ---------------------------------------------------------------------------
+def _write_cv_result(csv_path, fold, val_stems, result):
+    """Append (or replace) this fold's results row in the CV results CSV.
+
+    Columns: ``fold, val_images, msa_original, msa_finetuned, tiled_val_loss``. Each fold writes
+    its own row as soon as it finishes, so the table survives the one-fold-per-subprocess workflow
+    and partial runs (the printed summary, by contrast, only covers the folds run in *this*
+    process). Re-running a fold replaces its existing row instead of duplicating it (matched on the
+    fold index). Numeric fields are written with 6-decimal precision; missing values (e.g. mSA when
+    ``--no-comparison`` is set, or the loss when no ``best.pt`` was produced) are left blank.
+    """
+    fieldnames = ["fold", "val_images", "msa_original", "msa_finetuned", "tiled_val_loss"]
+
+    def _fmt(v):
+        return "" if v is None else f"{v:.6f}"
+
+    new_row = {
+        "fold": str(fold),
+        "val_images": ";".join(val_stems),
+        "msa_original": _fmt(result["msa_original"]),
+        "msa_finetuned": _fmt(result["msa_finetuned"]),
+        "tiled_val_loss": _fmt(result["best_metric"]),
+    }
+
+    # Read existing rows (dropping any prior row for this fold), so a rerun replaces rather than
+    # duplicates. Folds run sequentially (one subprocess at a time), so there is no write race.
+    rows = []
+    if os.path.exists(csv_path):
+        with open(csv_path, newline="") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("fold") != str(fold)]
+    rows.append(new_row)
+    rows.sort(key=lambda r: int(r["fold"]))
+
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path
+
+
+# ---------------------------------------------------------------------------
 # Training driver.
 # ---------------------------------------------------------------------------
 def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> dict:
@@ -720,11 +765,20 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> d
         shutil.rmtree(ckpt_dir)
         print(f"Fold {fold}: removed checkpoints ({ckpt_dir}); kept logs + figures.")
 
-    return {
+    result = {
         "best_metric": best_metric,
         "msa_original": statistics.mean(msa_original) if msa_original else None,
         "msa_finetuned": statistics.mean(msa_finetuned) if msa_finetuned else None,
     }
+
+    # Persist this fold's row immediately, so the numbers survive the one-fold-per-subprocess
+    # workflow even if a later fold crashes (the CSV is shared across folds via the base name).
+    val_stems = [os.path.splitext(os.path.basename(p))[0] for p in raw_val]
+    csv_path = os.path.join(save_root, f"{args.name}_cv_results.csv")
+    _write_cv_result(csv_path, fold, val_stems, result)
+    print(f"Fold {fold}: wrote CV results row -> {csv_path}")
+
+    return result
 
 
 def main():
