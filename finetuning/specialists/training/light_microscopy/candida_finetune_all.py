@@ -53,6 +53,7 @@ from micro_sam.training.util import require_8bit
 from candida_multigpu_ais import (
     build_unetr_model,
     RankTensorboardLogger,
+    SyncedValTrainer,
     fixed_crop_val_dataset,
     build_train_transform,
     _discover_pairs,
@@ -174,8 +175,11 @@ def run_training(args):
         optimizer_kwargs=dict(lr=args.lr),
         lr_scheduler_callable=torch.optim.lr_scheduler.ReduceLROnPlateau,
         lr_scheduler_kwargs=dict(mode="min", factor=0.9, patience=3),
-        # trainer params (forwarded to DefaultTrainer via **kwargs)
-        trainer_callable=torch_em.trainer.DefaultTrainer,
+        # trainer params (forwarded to DefaultTrainer via **kwargs). SyncedValTrainer all-reduces
+        # the per-rank validation metric so early stopping / checkpoint selection / LR scheduling
+        # fire identically on every rank (otherwise ranks desync and dead-lock in the gradient
+        # all-reduce). See candida_multigpu_ais.SyncedValTrainer.
+        trainer_callable=SyncedValTrainer,
         logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
         logger_kwargs=dict(spike_image_threshold=args.spike_image_threshold),
         name=args.name,

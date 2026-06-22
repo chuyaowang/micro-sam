@@ -113,6 +113,37 @@ class RankTensorboardLogger(TensorboardLogger):
 
 
 # ---------------------------------------------------------------------------
+# DDP-aware trainer: synchronize the validation metric across ranks
+# (module-level so it survives the mp.spawn re-import / pickle).
+# ---------------------------------------------------------------------------
+class SyncedValTrainer(torch_em.trainer.DefaultTrainer):
+    """``DefaultTrainer`` that all-reduces the validation metric to the mean over all ranks.
+
+    ``torch_em.multi_gpu_training`` wraps the val dataset in a ``DistributedSampler``, so each
+    rank validates on a *disjoint* shard of the tile grid (rank 0 -> tiles 0, 2, 4, ...; rank 1
+    -> tiles 1, 3, 5, ...) and ``_validate_impl`` returns the mean over that rank's shard only.
+    The early-stopping, checkpoint-selection and ``ReduceLROnPlateau`` decisions in ``fit`` are
+    then made independently per rank from *different* metric values, so the ranks can reach the
+    early-stopping threshold on different epochs. When one rank breaks out of the epoch loop while
+    the other enters the next training step, that step's gradient all-reduce has no partner and
+    dead-locks until the 600 s NCCL watchdog aborts the process (``OpType=ALLREDUCE`` timeout).
+
+    Averaging the metric across ranks makes every rank compute the same value -- the mean over the
+    *full* tile grid -- so all of those decisions stay in lock-step (no desync, no deadlock). It
+    also fixes a quieter bug: the reported/saved ``best_metric`` was previously only rank 0's half
+    of the tiles.
+    """
+
+    def _validate_impl(self, forward_context):
+        metric = super()._validate_impl(forward_context)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            metric_tensor = torch.tensor([metric], dtype=torch.float32, device=self.device)
+            torch.distributed.all_reduce(metric_tensor, op=torch.distributed.ReduceOp.AVG)
+            metric = metric_tensor.item()
+        return metric
+
+
+# ---------------------------------------------------------------------------
 # Deterministic, cell-rich validation patch (module-level for mp.spawn).
 # ---------------------------------------------------------------------------
 def _best_variance_patch(raw: np.ndarray, patch_shape) -> Tuple[slice, slice]:
@@ -634,8 +665,10 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> d
         optimizer_kwargs=dict(lr=args.lr),
         lr_scheduler_callable=torch.optim.lr_scheduler.ReduceLROnPlateau,
         lr_scheduler_kwargs=dict(mode="min", factor=0.9, patience=3),
-        # trainer params (forwarded to DefaultTrainer via **kwargs)
-        trainer_callable=torch_em.trainer.DefaultTrainer,
+        # trainer params (forwarded to DefaultTrainer via **kwargs). SyncedValTrainer all-reduces
+        # the per-rank validation metric so early stopping fires on the same epoch on every rank
+        # (otherwise ranks desync and the surviving rank dead-locks in the gradient all-reduce).
+        trainer_callable=SyncedValTrainer,
         logger=RankTensorboardLogger,  # each rank -> logs/<name>/rank<K>/ (separate TB runs)
         logger_kwargs=dict(spike_image_threshold=args.spike_image_threshold),
         name=name,
