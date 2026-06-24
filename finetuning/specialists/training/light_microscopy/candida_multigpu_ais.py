@@ -431,22 +431,63 @@ def _to_channels_last(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(image)
 
 
+def _safe_load_checkpoint(checkpoint_path):
+    """``torch.load`` a trainer checkpoint without needing the symbols pickled into its ``init`` blob.
+
+    ``DefaultTrainer.save_checkpoint`` stores an ``init`` entry that pickles the train/val ``Dataset``
+    objects, and therefore their transforms (e.g. ``SplitPhotometricPipeline``, ``_no_augmentation``).
+    Those transforms were defined in a training script that ran as ``__main__`` (``python
+    candida_*.py``), so pickle recorded their class path as ``__main__.<Name>`` -- unresolvable when
+    the checkpoint is loaded from a *different* process such as a notebook, raising
+    ``AttributeError: Can't get attribute '<Name>' on <module '__main__'>``. Callers here only consume
+    ``model_state`` / scalar fields, so any global that cannot be imported is replaced with a harmless
+    placeholder. Those placeholders live only inside the ``init`` blob, which the checkpoint-stripping
+    helpers drop before re-saving, so they are never used or persisted.
+    """
+    import pickle
+    import types
+
+    class _MissingGlobal:
+        """Stand-in for an unresolvable pickled class/function; reconstructs without side effects."""
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __setstate__(self, state):
+            pass
+
+    class _TolerantUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            try:
+                return super().find_class(module, name)
+            except Exception:
+                return _MissingGlobal
+
+    # torch inspects ``pickle_module.__name__`` (to special-case dill), so the shim needs one.
+    shim = types.SimpleNamespace(Unpickler=_TolerantUnpickler, load=pickle.load, __name__="candida_tolerant_pickle")
+    return torch.load(checkpoint_path, map_location="cpu", weights_only=False, pickle_module=shim)
+
+
 def _strip_ddp_prefix(checkpoint_path, out_dir):
-    """Return a checkpoint whose ``model_state`` keys have no ``module.`` (DDP) prefix.
+    """Return a *portable* checkpoint whose ``model_state`` keys have no ``module.`` (DDP) prefix.
 
     ``train_multi_gpu`` trains a ``DistributedDataParallel``-wrapped model, so ``best.pt``'s
     ``model_state`` keys are prefixed ``module.`` (e.g. ``module.encoder.pos_embed``).
     ``export_instance_segmentation_model`` filters for keys starting with ``encoder`` and would
-    miss them. If the prefix is present, write a stripped copy into ``out_dir`` and return its
-    path; otherwise return the original path unchanged (no copy).
+    miss them. Always writes a cleaned copy into ``out_dir`` and returns its path: the ``module.``
+    prefix is stripped from ``model_state`` (a no-op for single-GPU checkpoints) and the trainer
+    ``init`` blob is dropped. Dropping ``init`` is what makes the copy portable -- it pickles the
+    datasets and their transforms, often under ``__main__`` (see ``_safe_load_checkpoint``), so
+    keeping it would re-introduce the cross-process unpickling error on any later load.
     """
     from collections import OrderedDict
 
-    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = _safe_load_checkpoint(checkpoint_path)
+    state.pop("init", None)  # drop the un-portable trainer-init blob (datasets + their transforms)
+
     model_state = state.get("model_state", None)
-    if model_state is None or not all(k.startswith("module.") for k in model_state):
-        return checkpoint_path
-    state["model_state"] = OrderedDict((k[len("module."):], v) for k, v in model_state.items())
+    if model_state is not None and all(k.startswith("module.") for k in model_state):
+        state["model_state"] = OrderedDict((k[len("module."):], v) for k, v in model_state.items())
+
     normalized_path = os.path.join(out_dir, "_cv_best_no_ddp.pt")
     torch.save(state, normalized_path)
     return normalized_path
@@ -735,7 +776,7 @@ def run_fold(args, fold: int, raw_paths: List[str], label_paths: List[str]) -> d
     # Read the fold's best (tiled-val) metric back before any checkpoint cleanup.
     best_metric = None
     if os.path.exists(best_ckpt):
-        best_metric = torch.load(best_ckpt, map_location="cpu", weights_only=False).get("best_metric")
+        best_metric = _safe_load_checkpoint(best_ckpt).get("best_metric")
         print(f"Fold {fold}: best tiled-val metric = {best_metric:.6f}")
     else:
         print(f"Fold {fold}: no best.pt found at {best_ckpt}")

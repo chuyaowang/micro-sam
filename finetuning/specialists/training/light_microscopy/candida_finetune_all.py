@@ -66,6 +66,7 @@ from candida_multigpu_ais import (
     _load_predictor_and_segmenter,
     _run_ais,
     _save_comparison_figure,
+    _safe_load_checkpoint,
 )
 
 
@@ -95,17 +96,18 @@ def _export_final_model(best_checkpoint, output_path, model_type, encoder):
         print(f"[finetune-all] export skipped: no checkpoint at {best_checkpoint}")
         return None
 
-    state = torch.load(best_checkpoint, map_location="cpu", weights_only=False)
+    state = _safe_load_checkpoint(best_checkpoint)
+    state.pop("init", None)  # drop the un-portable trainer-init blob (datasets + transforms) before re-save
     model_state = state.get("model_state", None)
     if model_state is not None and all(k.startswith("module.") for k in model_state):
         state["model_state"] = OrderedDict(
             (k[len("module."):], v) for k, v in model_state.items()
         )
-        trained_path = best_checkpoint + ".no_ddp.tmp"
-        torch.save(state, trained_path)
-        print("[finetune-all] stripped DDP 'module.' prefix before export")
-    else:
-        trained_path = best_checkpoint  # single-GPU / already-stripped checkpoint
+    # Always re-save a cleaned copy (DDP prefix stripped, init dropped) so the export reads a portable
+    # checkpoint regardless of how best.pt was produced.
+    trained_path = best_checkpoint + ".no_ddp.tmp"
+    torch.save(state, trained_path)
+    print("[finetune-all] wrote portable checkpoint (DDP prefix stripped, init dropped) before export")
 
     sam_training.export_instance_segmentation_model(
         trained_model_path=trained_path, output_path=output_path,
@@ -138,7 +140,7 @@ def _val_patch_losses(args, raw_paths, label_paths, best_ckpt, device):
         model_type=args.model_type, checkpoint_path=args.encoder, decoder_path=args.decoder,
         freeze=args.freeze, strict_decoder_loading=not args.flexible_decoder_loading,
     )
-    state = torch.load(best_ckpt, map_location="cpu", weights_only=False)["model_state"]
+    state = _safe_load_checkpoint(best_ckpt)["model_state"]
     if all(k.startswith("module.") for k in state):
         state = OrderedDict((k[len("module."):], v) for k, v in state.items())
     model.load_state_dict(state)
@@ -364,7 +366,7 @@ def run_training(args):
     save_root = "" if args.save_root is None else args.save_root
     best_ckpt = os.path.join(save_root, "checkpoints", args.name, "best.pt")
     if os.path.exists(best_ckpt):
-        best_metric = torch.load(best_ckpt, map_location="cpu", weights_only=False).get("best_metric")
+        best_metric = _safe_load_checkpoint(best_ckpt).get("best_metric")
         print(f"\nBest validation metric (fixed train crops) = {best_metric:.6f}")
     else:
         print(f"\nNo best.pt found at {best_ckpt}")
