@@ -36,20 +36,25 @@ Example (Kaggle, 2x T4)::
 """
 
 import os
+import csv
 import argparse
+import statistics
 from collections import OrderedDict
 
+import numpy as np
 import torch
 
 import torch_em
 from torch_em.data.sampler import MinInstanceSampler
 from torch_em.multi_gpu_training import train_multi_gpu
+from torch_em.util import load_image
 
 from micro_sam.training import default_sam_dataset
 from micro_sam.training.util import require_8bit
 
 # Reuse the exact CV building blocks (model factory, per-rank logger, fixed-crop val dataset,
-# train augmentation and data discovery) so there is no duplicated training code.
+# train augmentation, data discovery and the before/after AIS comparison helpers) so there is no
+# duplicated training / inference code.
 from candida_multigpu_ais import (
     build_unetr_model,
     RankTensorboardLogger,
@@ -57,6 +62,10 @@ from candida_multigpu_ais import (
     fixed_crop_val_dataset,
     build_train_transform,
     _discover_pairs,
+    _to_channels_last,
+    _load_predictor_and_segmenter,
+    _run_ais,
+    _save_comparison_figure,
 )
 
 
@@ -106,6 +115,165 @@ def _export_final_model(best_checkpoint, output_path, model_type, encoder):
         os.remove(trained_path)
     print(f"[finetune-all] exported AIS-ready model -> {output_path}")
     return output_path
+
+
+def _val_patch_losses(args, raw_paths, label_paths, best_ckpt, device):
+    """Per-image validation-patch loss for the fine-tuned model.
+
+    The all-data validation set is one fixed, cell-rich patch per image (``fixed_crop_val_dataset``),
+    so there are exactly N validation patches for N images. The trainer only ever reports the *mean*
+    over them, so this recomputes ``DiceBasedDistanceLoss`` for each image's patch individually --
+    exactly as ``DefaultTrainer._validate_impl`` does (``loss(model(x), y)`` on the 3-channel distance
+    output) -- using the weights from ``best.pt`` (the checkpoint that drove selection). The mean of
+    these per-patch losses therefore reproduces the saved ``best_metric``. Runs in fp32 (no autocast)
+    to avoid the fp16 decoder-NaN issue; values are within rounding of the AMP training metric.
+    Returns ``{stem: loss}`` (empty if ``best.pt`` is missing).
+    """
+    if not os.path.exists(best_ckpt):
+        print(f"[finetune-all] val-patch loss skipped: no checkpoint at {best_ckpt}")
+        return {}
+
+    # Rebuild the UNETR and load the fine-tuned weights (strip the DDP 'module.' prefix).
+    model = build_unetr_model(
+        model_type=args.model_type, checkpoint_path=args.encoder, decoder_path=args.decoder,
+        freeze=args.freeze, strict_decoder_loading=not args.flexible_decoder_loading,
+    )
+    state = torch.load(best_ckpt, map_location="cpu", weights_only=False)["model_state"]
+    if all(k.startswith("module.") for k in state):
+        state = OrderedDict((k[len("module."):], v) for k, v in state.items())
+    model.load_state_dict(state)
+    model = model.to(device).eval()
+
+    loss_fn = torch_em.loss.DiceBasedDistanceLoss(mask_distances_in_bg=True)
+    shared_ds_kwargs = dict(
+        raw_key=None, label_key=None, patch_shape=tuple(args.patch_shape),
+        with_segmentation_decoder=True, train_instance_segmentation_only=True,
+        with_channels=True, raw_transform=require_8bit,
+    )
+
+    losses = {}
+    for rp, lp in zip(raw_paths, label_paths):
+        stem = os.path.splitext(os.path.basename(rp))[0]
+        # One image -> the same single fixed validation patch the trainer used (augmentation off).
+        ds = fixed_crop_val_dataset(
+            raw_paths=[rp], label_paths=[lp], is_train=False,
+            transform=_no_augmentation, **shared_ds_kwargs,
+        )
+        x, y = ds[0]
+        x = torch.as_tensor(x).float().unsqueeze(0).to(device)
+        y = torch.as_tensor(y).float().unsqueeze(0).to(device)
+        with torch.no_grad():
+            loss = loss_fn(model(x), y)
+        losses[stem] = float(loss.item())
+        print(f"[finetune-all] val-patch loss {stem}: {losses[stem]:.6f}")
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return losses
+
+
+def compare_all_images(
+    raw_paths, label_paths, model_type, encoder, decoder, finetuned_export, figure_dir,
+    device=None, tile_shape=(512, 512), halo=(64, 64),
+):
+    """Before/after whole-image AIS on every (training) image: 2x6 figures + mSA.
+
+    NOTE: every image here was used for training, so this mSA is a *fit / sanity* check on the
+    training data, **not** a generalization estimate (the cross-validation script provides that).
+
+    Loads the original (encoder/decoder) and fine-tuned (already-exported ``.pth``) models **once
+    each** -- not per image -- then for every image runs tiled whole-image AIS with both, scores each
+    against the ground truth with mean segmentation accuracy, and writes ``comparison_<stem>.png``.
+    Returns a list of ``{"stem", "msa_original", "msa_finetuned"}`` dicts.
+    """
+    from micro_sam.util import get_device
+    from elf.evaluation import mean_segmentation_accuracy
+
+    device = get_device(device)
+    is_tiled = tile_shape is not None
+    os.makedirs(figure_dir, exist_ok=True)
+
+    # Load each model once; the segmenter is re-initialized per image inside _run_ais.
+    orig_predictor, orig_segmenter = _load_predictor_and_segmenter(
+        model_type, encoder, decoder, device, is_tiled,
+    )
+    ft_predictor, ft_segmenter = _load_predictor_and_segmenter(
+        model_type, finetuned_export, None, device, is_tiled,  # decoder lives inside the export
+    )
+
+    per_image = []
+    for rp, lp in zip(raw_paths, label_paths):
+        stem = os.path.splitext(os.path.basename(str(rp)))[0]
+        raw_image = _to_channels_last(np.asarray(load_image(rp)))
+        gt_labels = np.asarray(load_image(lp))
+
+        results, msa = {}, {}
+        results["original"] = _run_ais(orig_predictor, orig_segmenter, raw_image, tile_shape, halo)
+        msa["original"] = float(mean_segmentation_accuracy(results["original"]["instances"], gt_labels))
+        results["finetuned"] = _run_ais(ft_predictor, ft_segmenter, raw_image, tile_shape, halo)
+        msa["finetuned"] = float(mean_segmentation_accuracy(results["finetuned"]["instances"], gt_labels))
+
+        out_path = os.path.join(figure_dir, f"comparison_{stem}.png")
+        # "(train-set)" in the title flags that this is an optimistic fit check, not generalization.
+        _save_comparison_figure(raw_image, gt_labels, results, msa, out_path, model_type, f"{stem} (train-set)")
+        print(f"[finetune-all] {stem}: mSA original={msa['original']:.4f} -> finetuned={msa['finetuned']:.4f}")
+        per_image.append({"stem": stem, "msa_original": msa["original"], "msa_finetuned": msa["finetuned"]})
+
+    del orig_predictor, orig_segmenter, ft_predictor, ft_segmenter
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return per_image
+
+
+def _write_final_results(args, save_root, raw_paths, val_losses, per_image_msa):
+    """Persist one row per image (val-patch loss + before/after mSA) and print the aggregate summary.
+
+    Writes ``<save-root>/<name>_final_results.csv`` with columns
+    ``image, val_patch_loss, msa_original, msa_finetuned``. ``val_patch_loss`` is the fine-tuned
+    model's ``DiceBasedDistanceLoss`` on that image's fixed validation patch; the mSA columns are the
+    before/after whole-image scores (computed on TRAINING images here -- a fit/sanity check, not a
+    generalization estimate). Numeric fields use 6-decimal precision; missing values (e.g. mSA when
+    ``--no-comparison`` is set, or anything when no ``best.pt`` was produced) are left blank.
+    """
+    fieldnames = ["image", "val_patch_loss", "msa_original", "msa_finetuned"]
+
+    def _fmt(v):
+        return "" if v is None else f"{v:.6f}"
+
+    msa_by_stem = {d["stem"]: d for d in per_image_msa}
+    rows = []
+    for rp in raw_paths:
+        stem = os.path.splitext(os.path.basename(rp))[0]
+        m = msa_by_stem.get(stem, {})
+        rows.append({
+            "image": stem,
+            "val_patch_loss": _fmt(val_losses.get(stem)),
+            "msa_original": _fmt(m.get("msa_original")),
+            "msa_finetuned": _fmt(m.get("msa_finetuned")),
+        })
+
+    csv_path = os.path.join(save_root, f"{args.name}_final_results.csv")
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\n[finetune-all] wrote per-image results -> {csv_path}")
+
+    # Printed aggregate summary (mirrors the CV script's style).
+    vlosses = list(val_losses.values())
+    o_msa = [d["msa_original"] for d in per_image_msa if d["msa_original"] is not None]
+    f_msa = [d["msa_finetuned"] for d in per_image_msa if d["msa_finetuned"] is not None]
+    print(f"{'=' * 78}\nFinal all-data summary ({len(raw_paths)} images)")
+    if vlosses:
+        print(f"  mean val-patch loss (lower is better) = {statistics.mean(vlosses):.6f}")
+    if f_msa:
+        o_mean = statistics.mean(o_msa) if o_msa else float("nan")
+        f_mean = statistics.mean(f_msa)
+        print(f"  train-set mSA (fit check, NOT generalization -- see CV for that): "
+              f"original {o_mean:.4f} -> finetuned {f_mean:.4f}")
+    print("=" * 78)
 
 
 def run_training(args):
@@ -205,6 +373,39 @@ def run_training(args):
         export_path = args.export_path or os.path.join(save_root, f"{args.name}_ais.pth")
         _export_final_model(best_ckpt, export_path, args.model_type, args.encoder)
 
+    # Per-image diagnostics (main process, post-DDP): the fine-tuned model's loss on each image's
+    # fixed validation patch, plus an optional before/after whole-image AIS comparison (figure + mSA)
+    # on every image. NOTE: every image was used for training, so the mSA here is a fit / sanity check
+    # on the training data -- NOT a generalization estimate (the CV script provides that).
+    from micro_sam.util import get_device
+    device = get_device(None)
+
+    val_losses = _val_patch_losses(args, raw_paths, label_paths, best_ckpt, device)
+
+    per_image_msa = []
+    if not args.no_comparison and os.path.exists(best_ckpt):
+        figure_dir = os.path.join(save_root, "logs", args.name)
+        os.makedirs(figure_dir, exist_ok=True)
+        # The comparison needs an AIS-ready fine-tuned model. Reuse the exported one if present;
+        # otherwise export a temporary copy just for the comparison and delete it afterwards.
+        export_path = args.export_path or os.path.join(save_root, f"{args.name}_ais.pth")
+        tmp_export = None
+        if os.path.exists(export_path):
+            finetuned_export = export_path
+        else:
+            tmp_export = os.path.join(figure_dir, "_finetuned_export.pth")
+            finetuned_export = _export_final_model(best_ckpt, tmp_export, args.model_type, args.encoder)
+        if finetuned_export and os.path.exists(finetuned_export):
+            per_image_msa = compare_all_images(
+                raw_paths, label_paths, args.model_type, args.encoder, args.decoder,
+                finetuned_export, figure_dir, device=device,
+                tile_shape=tuple(args.comparison_tile_shape), halo=tuple(args.comparison_halo),
+            )
+        if tmp_export and os.path.exists(tmp_export):
+            os.remove(tmp_export)
+
+    _write_final_results(args, save_root, raw_paths, val_losses, per_image_msa)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -236,6 +437,13 @@ def main():
                         help="Skip exporting best.pt to an AIS-ready .pth after training.")
     parser.add_argument("--export-path", default=None,
                         help="Where to write the exported AIS model. Default: <save-root>/<name>_ais.pth.")
+    parser.add_argument("--no-comparison", action="store_true",
+                        help="Skip the before/after AIS figure + mSA scoring on all (training) images. "
+                             "The per-image validation-patch loss is still written.")
+    parser.add_argument("--comparison-tile-shape", type=int, nargs=2, default=[512, 512],
+                        help="Tile shape for the whole-image before/after AIS comparison inference.")
+    parser.add_argument("--comparison-halo", type=int, nargs=2, default=[64, 64],
+                        help="Per-tile overlap (halo) for the whole-image before/after AIS comparison inference.")
     args = parser.parse_args()
 
     # early_stopping=0 -> disable (DefaultTrainer treats None as 'no early stopping').
