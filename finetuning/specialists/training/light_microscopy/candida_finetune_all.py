@@ -18,8 +18,10 @@ Design
   ``fixed_crop_val_dataset`` and ``build_train_transform`` are imported from
   ``candida_multigpu_ais`` -- no duplicated model / augmentation / logger code.
 * **Auto-export.** After training, ``best.pt`` (a DDP checkpoint with ``module.``-prefixed keys)
-  is exported to an AIS-ready ``.pth`` (image encoder remapped + ``decoder_state``), so the
-  final model loads directly in ``run_automatic_instance_segmentation`` without manual fixing.
+  is exported to a split encoder/decoder pair -- ``<save-root>/<name>`` (full SAM weights, image
+  encoder remapped) and ``<save-root>/<name>_decoder`` (AIS decoder) -- matching the pretrained
+  ``vit_*_lm`` / ``vit_*_lm_decoder`` layout, so the final model loads directly in
+  ``run_automatic_instance_segmentation`` (the ``_decoder`` file is auto-discovered).
 
 Example (Kaggle, 2x T4)::
 
@@ -81,14 +83,23 @@ def _no_augmentation(raw, labels):
     return raw, labels
 
 
-def _export_final_model(best_checkpoint, output_path, model_type, encoder):
-    """Export the DDP ``best.pt`` into an AIS-ready model (image encoder remapped + decoder_state).
+def _export_final_model(best_checkpoint, encoder_out, decoder_out, model_type, encoder):
+    """Export the DDP ``best.pt`` into a split encoder + decoder pair (the pretrained layout).
+
+    Writes two standalone files matching the format of the pretrained ``vit_*_lm`` weights:
+      * ``encoder_out``  -- the full SAM ``state_dict`` (``image_encoder.*`` / ``prompt_encoder.*`` /
+        ``mask_decoder.*``), drop-in for ``--encoder`` / micro-sam ``checkpoint=``.
+      * ``decoder_out``  -- the AIS decoder ``state_dict`` (``decoder.*`` / ``deconv*`` / ...),
+        drop-in for ``--decoder``. Naming it ``<encoder_out>_decoder`` lets ``get_sam_model``
+        auto-discover it.
 
     ``train_multi_gpu`` trains a ``DistributedDataParallel``-wrapped model, so ``best.pt``'s
     ``model_state`` keys are prefixed ``module.`` (e.g. ``module.encoder.pos_embed``).
     ``export_instance_segmentation_model`` filters for keys starting with ``encoder`` and would
-    miss them, so the prefix is stripped into a temporary checkpoint first. Returns the export
-    path, or None if ``best.pt`` is missing.
+    miss them, so the prefix is stripped into a temporary checkpoint first. The canonical export
+    (which remaps ``image_encoder.* <- encoder.*``) is run to a temp combined file, then split so
+    the remap logic stays entirely in micro-sam. Returns ``(encoder_out, decoder_out)``, or None
+    if ``best.pt`` is missing.
     """
     import micro_sam.training as sam_training
 
@@ -109,14 +120,24 @@ def _export_final_model(best_checkpoint, output_path, model_type, encoder):
     torch.save(state, trained_path)
     print("[finetune-all] wrote portable checkpoint (DDP prefix stripped, init dropped) before export")
 
+    # Export to a temp combined file via the canonical helper, then split it into two standalone
+    # files. This keeps the image-encoder remapping in micro-sam (no reimplementation here).
+    combined_tmp = encoder_out + ".combined.tmp"
     sam_training.export_instance_segmentation_model(
-        trained_model_path=trained_path, output_path=output_path,
+        trained_model_path=trained_path, output_path=combined_tmp,
         model_type=model_type, initial_checkpoint_path=encoder,
     )
-    if trained_path != best_checkpoint and os.path.exists(trained_path):
-        os.remove(trained_path)
-    print(f"[finetune-all] exported AIS-ready model -> {output_path}")
-    return output_path
+    combined = _safe_load_checkpoint(combined_tmp)
+    out_dir = os.path.dirname(encoder_out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    torch.save(OrderedDict(combined["model_state"]), encoder_out)
+    torch.save(OrderedDict(combined["decoder_state"]), decoder_out)
+    for tmp in (trained_path, combined_tmp):
+        if tmp != best_checkpoint and os.path.exists(tmp):
+            os.remove(tmp)
+    print(f"[finetune-all] exported split model -> encoder: {encoder_out}  decoder: {decoder_out}")
+    return encoder_out, decoder_out
 
 
 def _val_patch_losses(args, raw_paths, label_paths, best_ckpt, device):
@@ -176,7 +197,7 @@ def _val_patch_losses(args, raw_paths, label_paths, best_ckpt, device):
 
 
 def compare_all_images(
-    raw_paths, label_paths, model_type, encoder, decoder, finetuned_export, figure_dir,
+    raw_paths, label_paths, model_type, encoder, decoder, finetuned_encoder, finetuned_decoder, figure_dir,
     device=None, tile_shape=(512, 512), halo=(64, 64),
 ):
     """Before/after whole-image AIS on every (training) image: 2x6 figures + mSA.
@@ -184,9 +205,10 @@ def compare_all_images(
     NOTE: every image here was used for training, so this mSA is a *fit / sanity* check on the
     training data, **not** a generalization estimate (the cross-validation script provides that).
 
-    Loads the original (encoder/decoder) and fine-tuned (already-exported ``.pth``) models **once
-    each** -- not per image -- then for every image runs tiled whole-image AIS with both, scores each
-    against the ground truth with mean segmentation accuracy, and writes ``comparison_<stem>.png``.
+    Loads the original (``encoder``/``decoder``) and fine-tuned (the exported
+    ``finetuned_encoder``/``finetuned_decoder`` pair) models **once each** -- not per image -- then
+    for every image runs tiled whole-image AIS with both, scores each against the ground truth with
+    mean segmentation accuracy, and writes ``comparison_<stem>.png``.
     Returns a list of ``{"stem", "msa_original", "msa_finetuned"}`` dicts.
     """
     from micro_sam.util import get_device
@@ -201,7 +223,7 @@ def compare_all_images(
         model_type, encoder, decoder, device, is_tiled,
     )
     ft_predictor, ft_segmenter = _load_predictor_and_segmenter(
-        model_type, finetuned_export, None, device, is_tiled,  # decoder lives inside the export
+        model_type, finetuned_encoder, finetuned_decoder, device, is_tiled,
     )
 
     per_image = []
@@ -371,9 +393,13 @@ def run_training(args):
     else:
         print(f"\nNo best.pt found at {best_ckpt}")
 
+    # Default split-export paths: encoder at <save-root>/<name>, decoder alongside as <name>_decoder
+    # (the pretrained vit_*_lm / vit_*_lm_decoder layout; the _decoder suffix is auto-discovered).
+    encoder_out = args.export_path or os.path.join(save_root, args.name)
+    decoder_out = encoder_out + "_decoder"
+
     if not args.no_export:
-        export_path = args.export_path or os.path.join(save_root, f"{args.name}_ais.pth")
-        _export_final_model(best_ckpt, export_path, args.model_type, args.encoder)
+        _export_final_model(best_ckpt, encoder_out, decoder_out, args.model_type, args.encoder)
 
     # Per-image diagnostics (main process, post-DDP): the fine-tuned model's loss on each image's
     # fixed validation patch, plus an optional before/after whole-image AIS comparison (figure + mSA)
@@ -388,23 +414,30 @@ def run_training(args):
     if not args.no_comparison and os.path.exists(best_ckpt):
         figure_dir = os.path.join(save_root, "logs", args.name)
         os.makedirs(figure_dir, exist_ok=True)
-        # The comparison needs an AIS-ready fine-tuned model. Reuse the exported one if present;
-        # otherwise export a temporary copy just for the comparison and delete it afterwards.
-        export_path = args.export_path or os.path.join(save_root, f"{args.name}_ais.pth")
-        tmp_export = None
-        if os.path.exists(export_path):
-            finetuned_export = export_path
+        # The comparison needs an AIS-ready fine-tuned model. Reuse the exported split pair if
+        # present; otherwise export a temporary pair just for the comparison and delete it after.
+        tmp_pair = None
+        if os.path.exists(encoder_out) and os.path.exists(decoder_out):
+            finetuned_encoder, finetuned_decoder = encoder_out, decoder_out
         else:
-            tmp_export = os.path.join(figure_dir, "_finetuned_export.pth")
-            finetuned_export = _export_final_model(best_ckpt, tmp_export, args.model_type, args.encoder)
-        if finetuned_export and os.path.exists(finetuned_export):
+            tmp_encoder = os.path.join(figure_dir, "_finetuned")
+            tmp_decoder = tmp_encoder + "_decoder"
+            exported = _export_final_model(best_ckpt, tmp_encoder, tmp_decoder, args.model_type, args.encoder)
+            if exported:
+                finetuned_encoder, finetuned_decoder = exported
+                tmp_pair = exported
+            else:
+                finetuned_encoder = finetuned_decoder = None
+        if finetuned_encoder and os.path.exists(finetuned_encoder):
             per_image_msa = compare_all_images(
                 raw_paths, label_paths, args.model_type, args.encoder, args.decoder,
-                finetuned_export, figure_dir, device=device,
+                finetuned_encoder, finetuned_decoder, figure_dir, device=device,
                 tile_shape=tuple(args.comparison_tile_shape), halo=tuple(args.comparison_halo),
             )
-        if tmp_export and os.path.exists(tmp_export):
-            os.remove(tmp_export)
+        if tmp_pair:
+            for f in tmp_pair:
+                if os.path.exists(f):
+                    os.remove(f)
 
     _write_final_results(args, save_root, raw_paths, val_losses, per_image_msa)
 
@@ -436,9 +469,10 @@ def main():
     parser.add_argument("--flexible-decoder-loading", action="store_true",
                         help="Allow loading a decoder with mismatched output channels (reinitializes them).")
     parser.add_argument("--no-export", action="store_true",
-                        help="Skip exporting best.pt to an AIS-ready .pth after training.")
+                        help="Skip exporting best.pt to the split encoder/decoder pair after training.")
     parser.add_argument("--export-path", default=None,
-                        help="Where to write the exported AIS model. Default: <save-root>/<name>_ais.pth.")
+                        help="Encoder output path (vit_*_lm format); the decoder is written alongside "
+                             "as <path>_decoder. Default: <save-root>/<name> (+ <name>_decoder).")
     parser.add_argument("--no-comparison", action="store_true",
                         help="Skip the before/after AIS figure + mSA scoring on all (training) images. "
                              "The per-image validation-patch loss is still written.")
